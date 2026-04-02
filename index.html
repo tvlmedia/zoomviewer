@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#0b0f16" />
+  <title>Meridional Raytracer (2D) — TVL Lens Builder</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+
+<body>
+  <a class="skipLink" href="#appMain">Skip to main</a>
+
+  <header class="topbar" role="banner">
+    <div class="brand" aria-label="TVL Lens Builder">
+      <div class="dot" aria-hidden="true"></div>
+      <div class="brandText">
+        <div class="title">Meridional Raytracer (2D)</div>
+        <div class="subtitle">OSLO-ish doorsnede • stop-aware • element builder • sanity check tool</div>
+      </div>
+    </div>
+
+    <div class="toolbar" role="toolbar" aria-label="Main toolbar">
+      <button id="btnNew" class="btn" type="button">New / Clear</button>
+      <button id="btnLoadOmit" class="btn" type="button">Load OMIT 50 preset</button>
+      <button id="btnLoadDemo" class="btn" type="button">Load demo lens</button>
+
+      <div class="sep" aria-hidden="true"></div>
+
+      <button id="btnAdd" class="btn" type="button">+ Surface</button>
+      <button id="btnAddElement" class="btn" type="button">+ Element</button>
+      <button id="btnDuplicate" class="btn" type="button">Duplicate</button>
+      <button id="btnMoveUp" class="btn" type="button">↑</button>
+      <button id="btnMoveDown" class="btn" type="button">↓</button>
+      <button id="btnRemove" class="btn btnDanger" type="button">Delete</button>
+
+      <div class="sep" aria-hidden="true"></div>
+
+      <button id="btnScaleToFocal" class="btn" type="button">Scale → FL</button>
+      <button id="btnSetTStop" class="btn" type="button">Set T</button>
+      <button id="btnAutoFocus" class="btn" type="button">Auto focus</button>
+
+      <div class="sep" aria-hidden="true"></div>
+
+      <button id="btnSave" class="btn" type="button">Save JSON</button>
+      <label class="fileBtn btn" role="button" tabindex="0">
+        Load JSON
+        <input id="fileLoad" type="file" accept="application/json" />
+      </label>
+    </div>
+  </header>
+
+  <main id="appMain" class="layout" role="main">
+    <!-- LEFT -->
+    <aside class="panel left" aria-label="Controls and surface table">
+      <section class="panelHeader">
+        <div class="h1">Surface Data</div>
+        <div class="hint">
+          Klik een rij om te selecteren. R=0 is plane. Glass = medium ná surface. Stop = 1 surface. IMS ap = sensor half-height.
+        </div>
+      </section>
+
+      <div class="leftScroll">
+        <section class="controls" aria-label="Lens and render controls">
+          <div class="controlGrid">
+            <div class="ctrl">
+              <label for="sensorPreset">Sensor preset</label>
+              <select id="sensorPreset"></select>
+            </div>
+
+            <div class="ctrl two">
+              <label for="sensorW">Sensor W (mm)</label>
+              <input id="sensorW" type="number" step="0.01" />
+            </div>
+
+            <div class="ctrl two">
+              <label for="sensorH">Sensor H (mm)</label>
+              <input id="sensorH" type="number" step="0.01" />
+            </div>
+
+            <div class="ctrl">
+              <label for="fieldAngle">Field angle (deg)</label>
+              <input id="fieldAngle" type="number" step="0.1" value="0" />
+            </div>
+
+            <div class="ctrl">
+              <label for="rayCount"># Rays</label>
+              <input id="rayCount" type="number" step="1" value="31" min="3" max="101" />
+            </div>
+
+            <div class="ctrl">
+              <label for="wavePreset">Wavelength</label>
+              <select id="wavePreset">
+                <option value="d">d-line (587.6nm) — simple</option>
+                <option value="g">g-line (blue) — approx</option>
+                <option value="c">c-line (red) — approx</option>
+              </select>
+            </div>
+
+            <div class="ctrl">
+              <label for="sensorOffset">Sensor offset (mm)</label>
+              <input id="sensorOffset" type="number" step="0.05" value="0" />
+            </div>
+
+            <div class="ctrl">
+              <label for="focusMode">Focus mode</label>
+              <select id="focusMode">
+                <option value="cam" selected>Cam focus (move sensor)</option>
+                <option value="lens">Lens focus (move lens)</option>
+              </select>
+            </div>
+
+            <div class="ctrl">
+              <label for="lensFocus">Lens focus (mm)</label>
+              <input id="lensFocus" type="number" step="0.05" value="0" />
+            </div>
+
+            <div class="ctrl">
+              <label for="renderScale">Render scale</label>
+              <input id="renderScale" type="range" min="0.6" max="2.6" step="0.05" value="1.25" />
+            </div>
+
+            <div class="ctrl two ctrlDivider"></div>
+
+            <div class="ctrl two">
+              <div class="subTitle">Zoom Viewer</div>
+              <div class="hint" style="margin-top:6px">
+                Laadt zoom-groepen uit je builder JSON en scrubs tussen wide/tele.
+              </div>
+            </div>
+
+            <div class="ctrl">
+              <label for="zoomWideFL">Wide FL (mm)</label>
+              <input id="zoomWideFL" type="number" step="0.1" min="5" value="24" />
+            </div>
+
+            <div class="ctrl">
+              <label for="zoomTeleFL">Tele FL (mm)</label>
+              <input id="zoomTeleFL" type="number" step="0.1" min="5" value="70" />
+            </div>
+
+            <div class="ctrl two">
+              <label for="zoomPos">Zoom positie: <span id="zoomPosOut">0%</span></label>
+              <input id="zoomPos" type="range" min="0" max="100" step="1" value="0" />
+            </div>
+
+            <div class="ctrl">
+              <label for="zoomAutoFocus">Auto-focus na zoom</label>
+              <input id="zoomAutoFocus" type="checkbox" checked />
+            </div>
+
+            <div class="ctrl">
+              <label>Zoom target</label>
+              <div id="zoomTargetOut" class="zoomReadout">24.0mm</div>
+            </div>
+
+            <div class="ctrl two zoomMeta">
+              <button id="btnZoomApplyNow" class="btn btnPrimary" type="button">Apply zoom position</button>
+              <div id="zoomRatioOut" class="hint">Zoom ratio: 2.92x</div>
+            </div>
+
+            <div class="ctrl two">
+              <label for="prevImg">Preview image</label>
+              <input id="prevImg" type="file" accept="image/*" />
+            </div>
+
+            <div class="ctrl">
+              <label for="prevObjDist">Object distance (mm)</label>
+              <input id="prevObjDist" type="number" step="1" value="2000" />
+            </div>
+
+            <div class="ctrl">
+              <label for="prevObjH">Object height (mm)</label>
+              <input id="prevObjH" type="number" step="1" value="1650" />
+            </div>
+
+            <div class="ctrl">
+              <label for="prevRes">Preview res</label>
+              <select id="prevRes">
+                <option value="256">256 px (fast)</option>
+                <option value="384">384 px</option>
+                <option value="512">512 px</option>
+                <option value="768">768 px (slow)</option>
+                <option value="1920" selected>1920 px (HQ)</option>
+              </select>
+            </div>
+
+            <div class="ctrl">
+              <label for="optDOF">Depth of Field</label>
+              <label class="hint" style="display:flex; gap:10px; align-items:center;">
+                <input id="optDOF" type="checkbox" />
+                <span>Enable DOF (slower)</span>
+              </label>
+            </div>
+
+            <div class="ctrl">
+              <label for="optCA">Chromatic Aberration</label>
+              <label class="hint" style="display:flex; gap:10px; align-items:center;">
+                <input id="optCA" type="checkbox" />
+                <span>Enable CA (slower)</span>
+              </label>
+            </div>
+
+            <div class="ctrl">
+              <label for="renderQuality">Quality / speed</label>
+              <select id="renderQuality">
+                <option value="draft">Draft (fast)</option>
+                <option value="normal" selected>Normal</option>
+                <option value="hq">High (slow)</option>
+              </select>
+            </div>
+
+            <div class="ctrl two">
+              <label>&nbsp;</label>
+              <button id="btnRenderPreview" class="btn btnPrimary" type="button">Render Preview</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="tableWrap" aria-label="Surface table">
+          <table class="tbl" aria-describedby="surfaceTableHelp">
+            <thead>
+              <tr>
+                <th style="width:42px">#</th>
+                <th style="width:86px">Type</th>
+                <th style="width:110px">Radius R</th>
+                <th style="width:110px">Thickness</th>
+                <th style="width:110px">Aperture</th>
+                <th style="width:170px">Glass</th>
+                <th style="width:70px">Stop?</th>
+              </tr>
+            </thead>
+            <tbody id="surfTbody"></tbody>
+          </table>
+          <div id="surfaceTableHelp" class="srOnly">
+            Gebruik pijltjes/duplicate/delete buttons om geselecteerde surface te beheren.
+          </div>
+        </section>
+      </div>
+
+      <section class="status" aria-label="Status">
+        <div id="statusText" class="statusLine">—</div>
+
+        <div class="badges">
+          <div id="badgeEfl" class="badge">EFL: —</div>
+          <div id="badgeBfl" class="badge">BFL: —</div>
+          <div id="badgeT" class="badge">T≈ —</div>
+          <div id="badgeVig" class="badge">Vignette: —</div>
+        </div>
+
+        <div class="badges">
+          <div id="badgeFov" class="badge badgeWide">FOV: —</div>
+          <div id="badgeCov" class="badge">COV: —</div>
+          <div id="badgeIC" class="badge badgeWide">Image Circle: —</div>
+        </div>
+
+        <div class="footerRow">
+          <div id="metaInfo" class="meta">sensor —</div>
+          <div id="footerWarn" class="warn"></div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- RIGHT -->
+    <section class="panel right" aria-label="Canvas views">
+      <div class="canvasHeader">
+        <div class="canvasTitle">
+          <div class="h1">Autodraw</div>
+          <div class="hint">drag = pan • wheel = zoom • dblclick = reset view</div>
+        </div>
+
+        <div class="topBadges" aria-label="Top badges">
+          <div id="badgeEflTop" class="pill">EFL: —</div>
+          <div id="badgeBflTop" class="pill">BFL: —</div>
+          <div id="badgeTTop" class="pill">T≈ —</div>
+          <div id="badgeFovTop" class="pill">FOV: —</div>
+          <div id="badgeCovTop" class="pill">COV: —</div>
+          <div id="badgeICTop" class="pill">IC: —</div>
+        </div>
+      </div>
+
+      <div class="canvasFrame">
+        <div class="canvasSplit" id="tvlCanvasSplit">
+          <div class="pane" id="raysPane">
+            <div class="paneTag">Rays</div>
+            <button id="btnRaysFS" class="fsBtn" type="button" title="Full Screen (R)">Full Screen (R)</button>
+            <canvas id="canvas"></canvas>
+          </div>
+
+          <div class="pane" id="previewPane">
+            <div class="paneTag">Preview</div>
+            <button id="btnPreviewFS" class="fsBtn" type="button" title="Full Screen (P)">Full Screen (P)</button>
+            <button id="btnPreviewRuler" class="fsBtn rulerBtn" type="button" title="Toggle diagonal ruler">Ruler</button>
+            <canvas id="previewCanvas"></canvas>
+
+            <!-- progress overlay -->
+            <div id="previewProgress" aria-hidden="true">
+              <div id="previewProgressBar"></div>
+              <div id="previewProgressText">0%</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="canvasOverlay">
+          <div class="overlayHelp" id="overlayHelp">
+            Tips: zet stop op “STOP” surface • IMS ap = sensor half-height • “Scale → FL” fixeert focal drift
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- MODALS (jouw modals blijven hetzelfde, maar script ondersteunt ze al) -->
+  <div id="newLensModal" class="modal hidden" aria-hidden="true"></div>
+  <div id="elementModal" class="modal hidden" aria-hidden="true"></div>
+
+  <div id="toastHost" class="toastHost" aria-live="polite" aria-atomic="true"></div>
+  <script src="./script.js"></script>
+</body>
+</html>
