@@ -96,6 +96,8 @@
 
   const DEBUG_VIEWER = true;
   const dbg = (...args) => { if (DEBUG_VIEWER) console.log("[viewer]", ...args); };
+  const PREVIEW_STRICT_STATE = true;
+  const PREVIEW_REVERSE_2D_FALLBACK = true;
 
   function pickEl(...ids) {
     for (const id of ids) {
@@ -1082,6 +1084,7 @@ function warnMissingGlass(name) {
 
   let lens = sanitizeLens(omit50ConceptV1());
   let _lastRenderStats = null;
+  let _lastRenderGeometry = null;
   let _recoveryInProgress = false;
   let _recoveryCooldown = 0;
 
@@ -1172,6 +1175,21 @@ function warnMissingGlass(name) {
     }
   }
 
+  function getRuntimeFocusState() {
+    const modeRaw = String(ui.focusMode?.value || "cam").toLowerCase();
+    const focusMode = modeRaw === "lens" ? "lens" : "cam";
+    if (ui.focusMode && ui.focusMode.value !== focusMode) ui.focusMode.value = focusMode;
+    const sensorOffset = Number(ui.sensorOffset?.value || 0);
+    const lensFocus = Number(ui.lensFocus?.value || 0);
+    return {
+      focusMode,
+      sensorOffset,
+      lensFocus,
+      sensorX: focusMode === "cam" ? sensorOffset : 0.0,
+      lensShift: focusMode === "lens" ? lensFocus : 0.0,
+    };
+  }
+
   function refreshGroupManagerUi(reason = "runtime") {
     const groupCount = Object.keys(lens?.groups || {}).length;
     dbg("refreshGroupManagerUi", { reason, groupCount });
@@ -1182,9 +1200,10 @@ function warnMissingGlass(name) {
     const fieldAngle = Number(ui.fieldAngle?.value || 0);
     const rayCount = Math.max(3, Number(ui.rayCount?.value || 31));
     const wavePreset = ui.wavePreset?.value || "d";
-    const focusMode = String(ui.focusMode?.value || "cam").toLowerCase();
-    const sensorX = (focusMode === "cam") ? Number(ui.sensorOffset?.value || 0) : 0.0;
-    const lensShift = (focusMode === "lens") ? Number(ui.lensFocus?.value || 0) : 0.0;
+    const focusState = getRuntimeFocusState();
+    const focusMode = focusState.focusMode;
+    const sensorX = focusState.sensorX;
+    const lensShift = focusState.lensShift;
     dbg("computeVertices", { label, focusMode, sensorX, lensShift });
     computeVertices(lens.surfaces, lensShift, sensorX);
     dbg("buildRays", { label, fieldAngle, rayCount });
@@ -2023,9 +2042,16 @@ function warnMissingGlass(name) {
     return { hit, t: best.t, vignetted, normal: Nout };
   }
 
-  function traceRayReverse3D(ray, surfaces, wavePreset){
+  function traceRayReverse3D(ray, surfaces, wavePreset, opts = null){
+    const o = opts || {};
+    const stopIdx = Number.isFinite(Number(o.stopIdx))
+      ? Number(o.stopIdx)
+      : findStopSurfaceIndex(surfaces);
     let vignetted = false;
     let tir = false;
+    let failReason = "";
+    let stopHit = false;
+    let stopPass = false;
 
     for (let i = surfaces.length - 1; i >= 0; i--){
       const s = surfaces[i];
@@ -2034,9 +2060,22 @@ function warnMissingGlass(name) {
       const isMECH = type === "MECH" || type === "BAFFLE" || type === "HOUSING";
 
       const hitInfo = intersectSurface3D(ray, s);
-      if (!hitInfo){ vignetted = true; break; }
+      if (!hitInfo){
+        vignetted = true;
+        failReason = `no-hit:${i}:${type || "?"}`;
+        break;
+      }
 
-      if (!isIMS && hitInfo.vignetted){ vignetted = true; break; }
+      if (i === stopIdx) {
+        stopHit = true;
+        if (!hitInfo.vignetted) stopPass = true;
+      }
+
+      if (!isIMS && hitInfo.vignetted){
+        vignetted = true;
+        failReason = `aperture:${i}:${type || "?"}`;
+        break;
+      }
 
       if (isIMS || isMECH){
         ray = { p: hitInfo.hit, d: ray.d };
@@ -2052,12 +2091,19 @@ function warnMissingGlass(name) {
       }
 
       const newDir = refract3(ray.d, hitInfo.normal, nRight, nLeft);
-      if (!newDir){ tir = true; break; }
+      if (!newDir){
+        tir = true;
+        failReason = `tir:${i}:${type || "?"}`;
+        break;
+      }
 
       ray = { p: hitInfo.hit, d: newDir };
     }
 
-    return { vignetted, tir, endRay: ray };
+    if (!failReason && (vignetted || tir)) {
+      failReason = vignetted ? "vignetted" : "tir";
+    }
+    return { vignetted, tir, endRay: ray, failReason, stopHit, stopPass };
   }
 
   function intersectPlaneX3D(ray, xPlane){
@@ -2105,7 +2151,7 @@ function warnMissingGlass(name) {
     for (const rS of radii) {
       chiefTotal++;
       const dirChief = normalize3({ x: xStop - startX, y: -rS, z: 0 });
-      const tr = traceRayReverse3D({ p: { x: startX, y: rS, z: 0 }, d: dirChief }, work, wavePreset);
+      const tr = traceRayReverse3D({ p: { x: startX, y: rS, z: 0 }, d: dirChief }, work, wavePreset, { stopIdx });
       if (tr?.vignetted || tr?.tir || !tr?.endRay) continue;
       const hitObj = intersectPlaneX3D(tr.endRay, xObjPlane);
       if (hitObj) chiefOk++;
@@ -2122,7 +2168,7 @@ function warnMissingGlass(name) {
           const pp = samplePupilDiskConcentric(stopAp, uu, vv);
           const target = { x: xStop, y: pp.y, z: pp.z };
           const dir = normalize3({ x: target.x - pS.x, y: target.y - pS.y, z: target.z - pS.z });
-          const tr = traceRayReverse3D({ p: pS, d: dir }, work, wavePreset);
+          const tr = traceRayReverse3D({ p: pS, d: dir }, work, wavePreset, { stopIdx });
           pupilTotal++;
           if (tr?.vignetted || tr?.tir || !tr?.endRay) continue;
           const hitObj = intersectPlaneX3D(tr.endRay, xObjPlane);
@@ -2179,6 +2225,15 @@ function warnMissingGlass(name) {
 
     const baseline = evals.find((e) => e.tag === "current") || evals[0];
     const best = evals[0];
+    if (PREVIEW_STRICT_STATE) {
+      return {
+        selected: baseline,
+        baseline,
+        best,
+        candidates: evals,
+        usedFallback: false,
+      };
+    }
     const better =
       !!best &&
       !!baseline &&
@@ -2701,6 +2756,77 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     resetPreviewRuntimeState(source);
     if (!ensurePreviewCanvasReady()) return;
     drawPreviewViewport();
+  }
+
+  function buildRenderStateSnapshot(path, surfaces, focusMode, lensShift, sensorX, extra = null) {
+    const ss = Array.isArray(surfaces) ? surfaces : [];
+    const stopIdx = findStopSurfaceIndex(ss);
+    const stopAp = stopIdx >= 0 ? Number(ss[stopIdx]?.ap || 0) : null;
+    const stopVx = stopIdx >= 0 ? Number(ss[stopIdx]?.vx || 0) : null;
+    const imsIdx = ss.findIndex((s) => String(s?.type || "").toUpperCase() === "IMS");
+    const imsVx = imsIdx >= 0 ? Number(ss[imsIdx]?.vx || 0) : null;
+    const objVx = ss.length ? Number(ss[0]?.vx || 0) : null;
+    const snap = {
+      path,
+      zoomPos: Number(ui.zoomPos?.value || 0),
+      appliedGroupOffsets: clone(lens?.zoomConfig?.appliedGroupOffsets || {}),
+      focusMode,
+      lensFocusUi: Number(ui.lensFocus?.value || 0),
+      sensorOffsetUi: Number(ui.sensorOffset?.value || 0),
+      lensShift,
+      sensorX,
+      stopIdx,
+      stopAp,
+      stopVx,
+      imsIdx,
+      imsVx,
+      objVx,
+      firstPhysicalVx: firstPhysicalVertexX(ss),
+      lastPhysicalVx: lastPhysicalVertexX(ss),
+      surfaceCount: ss.length,
+    };
+    if (extra && typeof extra === "object") {
+      Object.assign(snap, extra);
+    }
+    return snap;
+  }
+
+  function zoomOffsetsSignature(offsets) {
+    const parts = [];
+    const src = offsets && typeof offsets === "object" ? offsets : {};
+    const keys = Object.keys(src).sort();
+    for (const k of keys) {
+      const v = Number(src[k] || 0);
+      parts.push(`${k}:${Number.isFinite(v) ? v.toFixed(4) : "0.0000"}`);
+    }
+    return parts.join("|");
+  }
+
+  function storeLastRenderGeometrySnapshot(source, focusState) {
+    const fs = focusState || getRuntimeFocusState();
+    _lastRenderGeometry = {
+      source: String(source || "renderAll"),
+      ts: Date.now(),
+      focusMode: String(fs.focusMode || "cam"),
+      sensorX: Number(fs.sensorX || 0),
+      lensShift: Number(fs.lensShift || 0),
+      zoomPos: Number(ui.zoomPos?.value || 0),
+      offsetsSig: zoomOffsetsSignature(lens?.zoomConfig?.appliedGroupOffsets || {}),
+      surfaces: clone(lens?.surfaces || []),
+    };
+  }
+
+  function getStrictPreviewGeometry(focusState) {
+    const fs = focusState || getRuntimeFocusState();
+    const g = _lastRenderGeometry;
+    if (!g || !Array.isArray(g.surfaces) || !g.surfaces.length) return null;
+    if (String(g.focusMode || "") !== String(fs.focusMode || "")) return null;
+    if (Math.abs(Number(g.sensorX || 0) - Number(fs.sensorX || 0)) > 1e-6) return null;
+    if (Math.abs(Number(g.lensShift || 0) - Number(fs.lensShift || 0)) > 1e-6) return null;
+    if (Math.abs(Number(g.zoomPos || 0) - Number(ui.zoomPos?.value || 0)) > 1e-6) return null;
+    const currentSig = zoomOffsetsSignature(lens?.zoomConfig?.appliedGroupOffsets || {});
+    if (String(g.offsetsSig || "") !== currentSig) return null;
+    return clone(g.surfaces);
   }
 
   function worldToScreen(p, world) {
@@ -3368,14 +3494,28 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
       const { w: sensorW, h: sensorH, halfH } = getSensorWH();
 
-      const focusMode = String(ui.focusMode?.value || "cam").toLowerCase();
-      const sensorX = (focusMode === "cam") ? Number(ui.sensorOffset?.value || 0) : 0.0;
-      const lensShift = (focusMode === "lens") ? Number(ui.lensFocus?.value || 0) : 0;
+      const focusState = getRuntimeFocusState();
+      const focusMode = focusState.focusMode;
+      const sensorX = focusState.sensorX;
+      const lensShift = focusState.lensShift;
       const plX = -PL_FFD;
 
       let stats = getTraceStatsForCurrentState(source);
       if (!stats || !Array.isArray(stats.traces)) {
         stats = { rays: [], traces: [], valid: 0, vignetted: 0, tir: 0, invalid: 0, total: 0 };
+      }
+      storeLastRenderGeometrySnapshot(source, focusState);
+      if (DEBUG_VIEWER) {
+        const snap = buildRenderStateSnapshot("drawRays", lens.surfaces, focusMode, lensShift, sensorX, {
+          source,
+          traced: Number(stats.total || 0),
+          valid: Number(stats.valid || 0),
+          vignetted: Number(stats.vignetted || 0),
+          tir: Number(stats.tir || 0),
+        });
+        console.groupCollapsed("[viewer-state] drawRays");
+        console.log(snap);
+        console.groupEnd();
       }
 
       const shouldRecover =
@@ -3824,6 +3964,12 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     pctx.font = "10px " + (getComputedStyle(document.documentElement).getPropertyValue("--mono") || "ui-monospace").trim();
     const hdr = `DBG chief ${diag.chiefOk || 0}/${diag.chiefTotal || 0} • pupil ${diag.pupilOk || 0}/${diag.pupilTotal || 0} • lit ${(100 * Number(diag.litRatio || 0)).toFixed(2)}%`;
     pctx.fillText(hdr, box.x + 8, box.y + 12);
+    const sub = `stop pass C ${diag.chiefStopPass || 0}/${diag.chiefLaunches || 0} • P ${diag.pupilStopPass || 0}/${diag.pupilLaunches || 0} • obj C ${diag.chiefObjHits || 0} P ${diag.pupilObjHits || 0}`;
+    pctx.fillStyle = "rgba(255,255,255,.68)";
+    pctx.fillText(sub, box.x + 8, box.y + 24);
+    const sub2 = `fallback2D chief ${diag.chief2dFallback || 0} • pupil ${diag.pupil2dFallback || 0}`;
+    pctx.fillStyle = "rgba(255,255,255,.56)";
+    pctx.fillText(sub2, box.x + 8, box.y + 35);
     pctx.fillStyle = "rgba(255,194,46,.95)";
     pctx.fillText("chief", box.x + 8, box.y + box.h - 6);
     pctx.fillStyle = "rgba(79,150,255,.95)";
@@ -4683,9 +4829,10 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   const spp = doDOF ? (q === "hq" ? 64 : (q === "draft" ? 12 : 28)) : 1;
   const lutPupilSqrt = (q === "hq" ? 16 : (q === "draft" ? 10 : 14));
 
-  const focusModeUi = String(ui.focusMode?.value || "cam").toLowerCase();
-  const sensorXUi   = (focusModeUi === "cam") ? Number(ui.sensorOffset?.value || 0) : 0.0;
-  const lensShiftUi = (focusModeUi === "lens") ? Number(ui.lensFocus?.value || 0) : 0.0;
+  const focusStateUi = getRuntimeFocusState();
+  const focusModeUi = focusStateUi.focusMode;
+  const sensorXUi   = focusStateUi.sensorX;
+  const lensShiftUi = focusStateUi.lensShift;
 
   const wavePreset = ui.wavePreset?.value || "d";
   const { w: sensorW, h: sensorH } = getSensorWH();
@@ -4704,19 +4851,40 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   const halfHv = sensorHv * 0.5;
   const rMaxSensor = Math.hypot(halfWv, halfHv);
 
-  const choice = choosePreviewState(
-    lens.surfaces,
-    { sensorX: sensorXUi, lensShift: lensShiftUi },
-    wavePreset,
-    objDist,
-    rMaxSensor
-  );
-  const selectedState = choice?.selected || choice?.baseline || {
-    tag: "current",
-    sensorX: sensorXUi,
-    lensShift: lensShiftUi,
-    work: clone(lens.surfaces),
-  };
+  const strictGeometry = PREVIEW_STRICT_STATE ? getStrictPreviewGeometry(focusStateUi) : null;
+  let choice = null;
+  let selectedState = null;
+  if (strictGeometry) {
+    selectedState = {
+      tag: "drawRays-state",
+      sensorX: sensorXUi,
+      lensShift: lensShiftUi,
+      score: 0,
+      work: strictGeometry,
+    };
+    choice = {
+      selected: selectedState,
+      baseline: selectedState,
+      best: selectedState,
+      candidates: [selectedState],
+      usedFallback: false,
+      strictGeometry: true,
+    };
+  } else {
+    choice = choosePreviewState(
+      lens.surfaces,
+      { sensorX: sensorXUi, lensShift: lensShiftUi },
+      wavePreset,
+      objDist,
+      rMaxSensor
+    );
+    selectedState = choice?.selected || choice?.baseline || {
+      tag: "current",
+      sensorX: sensorXUi,
+      lensShift: lensShiftUi,
+      work: clone(lens.surfaces),
+    };
+  }
   const previewSurfaces = selectedState.work || clone(lens.surfaces);
   const sensorX = Number(selectedState.sensorX || 0);
   const lensShift = Number(selectedState.lensShift || 0);
@@ -4725,6 +4893,36 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   const xStop = Number(stopSurf?.vx || 0);
   const stopAp = Math.max(1e-6, Number(stopSurf?.ap || 0));
   const xObjPlane = Number(selectedState.xObjPlane || ((previewSurfaces[0]?.vx ?? 0) - objDist));
+  if (DEBUG_VIEWER) {
+    const raysRef = buildRenderStateSnapshot("drawRays-ref", lens.surfaces, focusModeUi, lensShiftUi, sensorXUi, {
+      source: "renderPreview",
+    });
+    const snap = buildRenderStateSnapshot("previewReverse", previewSurfaces, focusModeUi, lensShift, sensorX, {
+      previewState: selectedState.tag || "current",
+      source: "renderPreview",
+      xStop,
+      stopAp,
+      xObjPlane,
+      strictState: PREVIEW_STRICT_STATE,
+      strictGeometryUsed: !!choice?.strictGeometry,
+      strictGeometrySource: String(_lastRenderGeometry?.source || ""),
+      selectedScore: Number(selectedState?.score || 0),
+    });
+    console.groupCollapsed("[viewer-state] previewReverse");
+    console.log("drawRaysRef", raysRef);
+    console.log(snap);
+    console.log("candidateSummary", (choice?.candidates || []).map((c) => ({
+      tag: c?.tag || "",
+      score: Number(c?.score || 0),
+      chiefOk: Number(c?.chiefOk || 0),
+      chiefTotal: Number(c?.chiefTotal || 0),
+      pupilOk: Number(c?.pupilOk || 0),
+      pupilTotal: Number(c?.pupilTotal || 0),
+      sensorX: Number(c?.sensorX || 0),
+      lensShift: Number(c?.lensShift || 0),
+    })));
+    console.groupEnd();
+  }
 
   if (choice?.usedFallback) {
     const sig = `${selectedState.tag}|${sensorX.toFixed(3)}|${lensShift.toFixed(3)}`;
@@ -4846,9 +5044,26 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       pupilOk: 0,
       pupilTotal: 0,
       transFloorFallback: 0,
+      chiefLaunches: 0,
+      chiefStopHit: 0,
+      chiefStopPass: 0,
+      chiefObjHits: 0,
+      chiefFailNoHit: 0,
+      chiefFailAperture: 0,
+      chiefFailTir: 0,
+      pupilLaunches: 0,
+      pupilStopHit: 0,
+      pupilStopPass: 0,
+      pupilObjHits: 0,
+      pupilFailNoHit: 0,
+      pupilFailAperture: 0,
+      pupilFailTir: 0,
+      pupil2dFallback: 0,
       chiefCurve: new Float32Array(LUT_N),
       transCurve: new Float32Array(LUT_N),
       heatCurve: new Float32Array(LUT_N),
+      chiefLaunchSamples: [],
+      pupilLaunchSamples: [],
     };
 
     function buildStep() {
@@ -4871,12 +5086,31 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
           // chief ray -> object radius
           {
             const dirChief = normalize3({ x: xStop - startX, y: -rS, z: 0 });
-            const trC = traceRayReverse3D({ p: pS, d: dirChief }, previewSurfaces, wave);
+            if (lutDiag.chiefLaunchSamples.length < 8 && ch === 1) {
+              lutDiag.chiefLaunchSamples.push({
+                k,
+                rS,
+                startX,
+                startY: pS.y,
+                startZ: pS.z,
+                targetX: xStop,
+                targetY: -rS,
+                targetZ: 0,
+                dirX: dirChief.x,
+                dirY: dirChief.y,
+                dirZ: dirChief.z,
+              });
+            }
+            const trC = traceRayReverse3D({ p: pS, d: dirChief }, previewSurfaces, wave, { stopIdx });
+            lutDiag.chiefLaunches++;
+            if (trC?.stopHit) lutDiag.chiefStopHit++;
+            if (trC?.stopPass) lutDiag.chiefStopPass++;
             if (!trC.vignetted && !trC.tir) {
               const hitObj = intersectPlaneX3D(trC.endRay, xObjPlane);
               if (hitObj) {
                 rObjLUT[ch][k] = Math.hypot(hitObj.y, hitObj.z);
                 chiefOk = true;
+                lutDiag.chiefObjHits++;
               }
             }
             if (!chiefOk) {
@@ -4894,6 +5128,10 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
             if (chiefOk) lutDiag.chiefOk++;
             else {
               lutDiag.chiefFail++;
+              const fr = String(trC?.failReason || "");
+              if (fr.startsWith("no-hit:")) lutDiag.chiefFailNoHit++;
+              else if (fr.startsWith("aperture:")) lutDiag.chiefFailAperture++;
+              else if (fr.startsWith("tir:")) lutDiag.chiefFailTir++;
               rObjLUT[ch][k] = 0;
             }
             if (chiefOk) chiefPassK++;
@@ -4911,17 +5149,55 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
               const pp = samplePupilDiskConcentric(stopAp, uu, vv);
               const target = { x: xStop, y: pp.y, z: pp.z };
               const dir = normalize3({ x: target.x - pS.x, y: target.y - pS.y, z: target.z - pS.z });
+              if (lutDiag.pupilLaunchSamples.length < 10 && ch === 1) {
+                lutDiag.pupilLaunchSamples.push({
+                  k,
+                  rS,
+                  startX,
+                  startY: pS.y,
+                  startZ: pS.z,
+                  targetX: target.x,
+                  targetY: target.y,
+                  targetZ: target.z,
+                  dirX: dir.x,
+                  dirY: dir.y,
+                  dirZ: dir.z,
+                });
+              }
 
-              const tr = traceRayReverse3D({ p: pS, d: dir }, previewSurfaces, wave);
+              const tr = traceRayReverse3D({ p: pS, d: dir }, previewSurfaces, wave, { stopIdx });
               total++;
               lutDiag.pupilTotal++;
-              if (tr.vignetted || tr.tir) continue;
-
-              const hitObj = intersectPlaneX3D(tr.endRay, xObjPlane);
-              if (!hitObj) continue;
+              lutDiag.pupilLaunches++;
+              if (tr?.stopHit) lutDiag.pupilStopHit++;
+              if (tr?.stopPass) lutDiag.pupilStopPass++;
+              let hitObj = null;
+              if (!tr.vignetted && !tr.tir) {
+                hitObj = intersectPlaneX3D(tr.endRay, xObjPlane);
+              }
+              if (!hitObj && PREVIEW_REVERSE_2D_FALLBACK) {
+                const dir2 = normalize({ x: target.x - startX, y: target.y - pS.y });
+                const tr2 = traceRayReverse({ p: { x: startX, y: pS.y }, d: dir2 }, previewSurfaces, wave);
+                if (tr2 && !tr2.vignetted && !tr2.tir && tr2.endRay) {
+                  const hit2 = intersectPlaneX(tr2.endRay, xObjPlane);
+                  if (hit2) {
+                    hitObj = { y: hit2.y, z: 0 };
+                    lutDiag.pupil2dFallback++;
+                  }
+                }
+              }
+              if (!hitObj) {
+                const frFail = String(tr?.failReason || "");
+                if (frFail.startsWith("no-hit:")) lutDiag.pupilFailNoHit++;
+                else if (frFail.startsWith("aperture:")) lutDiag.pupilFailAperture++;
+                else if (frFail.startsWith("tir:")) lutDiag.pupilFailTir++;
+                else lutDiag.pupilFailNoHit++;
+                continue;
+              }
 
               ok++;
               lutDiag.pupilOk++;
+              lutDiag.pupilObjHits++;
               sumY += hitObj.y; sumZ += hitObj.z;
               sumYY += hitObj.y * hitObj.y;
               sumZZ += hitObj.z * hitObj.z;
@@ -4965,12 +5241,33 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
           pupilOk: lutDiag.pupilOk,
           pupilTotal: lutDiag.pupilTotal,
           transFloorFallback: lutDiag.transFloorFallback,
+          chiefStopHit: lutDiag.chiefStopHit,
+          chiefStopPass: lutDiag.chiefStopPass,
+          chiefObjHits: lutDiag.chiefObjHits,
+          chiefFailNoHit: lutDiag.chiefFailNoHit,
+          chiefFailAperture: lutDiag.chiefFailAperture,
+          chiefFailTir: lutDiag.chiefFailTir,
+          pupilStopHit: lutDiag.pupilStopHit,
+          pupilStopPass: lutDiag.pupilStopPass,
+          pupilObjHits: lutDiag.pupilObjHits,
+          pupilFailNoHit: lutDiag.pupilFailNoHit,
+          pupilFailAperture: lutDiag.pupilFailAperture,
+          pupilFailTir: lutDiag.pupilFailTir,
+          pupil2dFallback: lutDiag.pupil2dFallback,
           focusMode: focusModeUi,
           previewState: selectedState.tag || "current",
           lensShift,
           sensorX,
           zoomPos: Number(ui.zoomPos?.value || 0),
+          stopIdx,
+          stopAp,
+          xStop,
+          xObjPlane,
+          startX,
+          objDist,
           candidateSummary,
+          chiefLaunchSamples: lutDiag.chiefLaunchSamples,
+          pupilLaunchSamples: lutDiag.pupilLaunchSamples,
           appliedGroupOffsets: clone(lens?.zoomConfig?.appliedGroupOffsets || {}),
         });
         showWarn("Preview reverse-map is zwak; rendering kan falen.");
@@ -5095,16 +5392,39 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         lensShift,
         sensorX,
         zoomPos: Number(ui.zoomPos?.value || 0),
+        stopIdx,
+        stopAp,
+        xStop,
+        xObjPlane,
+        startX,
+        objDist,
         chiefOk: lutDiag.chiefOk,
         chiefTotal: lutDiag.chiefOk + lutDiag.chiefFail,
+        chiefLaunches: lutDiag.chiefLaunches,
+        chiefStopHit: lutDiag.chiefStopHit,
+        chiefStopPass: lutDiag.chiefStopPass,
+        chiefObjHits: lutDiag.chiefObjHits,
+        chiefFailNoHit: lutDiag.chiefFailNoHit,
+        chiefFailAperture: lutDiag.chiefFailAperture,
+        chiefFailTir: lutDiag.chiefFailTir,
         pupilOk: lutDiag.pupilOk,
         pupilTotal: lutDiag.pupilTotal,
+        pupilLaunches: lutDiag.pupilLaunches,
+        pupilStopHit: lutDiag.pupilStopHit,
+        pupilStopPass: lutDiag.pupilStopPass,
+        pupilObjHits: lutDiag.pupilObjHits,
+        pupilFailNoHit: lutDiag.pupilFailNoHit,
+        pupilFailAperture: lutDiag.pupilFailAperture,
+        pupilFailTir: lutDiag.pupilFailTir,
+        pupil2dFallback: lutDiag.pupil2dFallback,
         transFloorFallback: lutDiag.transFloorFallback,
         litRatio,
         litPx,
         width: W,
         height: H,
         candidateSummary,
+        chiefLaunchSamples: lutDiag.chiefLaunchSamples,
+        pupilLaunchSamples: lutDiag.pupilLaunchSamples,
         appliedGroupOffsets: clone(lens?.zoomConfig?.appliedGroupOffsets || {}),
         chiefCurve: downsamplePreviewCurve(lutDiag.chiefCurve),
         transCurve: downsamplePreviewCurve(lutDiag.transCurve),
@@ -5186,10 +5506,19 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
             for (let ch = 0; ch < 3; ch++) {
               const wave = WAVES[ch];
-              const tr = traceRayReverse3D({ p: pS, d: dir0 }, previewSurfaces, wave);
-              if (tr.vignetted || tr.tir) continue;
-
-              const hitObj = intersectPlaneX3D(tr.endRay, xObjPlane);
+              const tr = traceRayReverse3D({ p: pS, d: dir0 }, previewSurfaces, wave, { stopIdx });
+              let hitObj = null;
+              if (!tr.vignetted && !tr.tir) {
+                hitObj = intersectPlaneX3D(tr.endRay, xObjPlane);
+              }
+              if (!hitObj && PREVIEW_REVERSE_2D_FALLBACK) {
+                const dir2 = normalize({ x: target.x - startX, y: target.y - pS.y });
+                const tr2 = traceRayReverse({ p: { x: startX, y: pS.y }, d: dir2 }, previewSurfaces, wave);
+                if (tr2 && !tr2.vignetted && !tr2.tir && tr2.endRay) {
+                  const hit2 = intersectPlaneX(tr2.endRay, xObjPlane);
+                  if (hit2) hitObj = { y: hit2.y, z: 0 };
+                }
+              }
               if (!hitObj) continue;
 
               const uv = objectMmToUV(hitObj.y, hitObj.z);
@@ -5236,6 +5565,12 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
           lensShift,
           sensorX,
           zoomPos: Number(ui.zoomPos?.value || 0),
+          stopIdx,
+          stopAp,
+          xStop,
+          xObjPlane,
+          startX,
+          objDist,
           litRatio,
           litPx,
           width: W,
