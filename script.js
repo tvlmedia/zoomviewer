@@ -134,6 +134,27 @@
     if (text) console.warn("[viewer]", text);
   }
 
+  function hasPreviewSourceImage() {
+    return !!(preview.ready && preview.imgData && preview.imgCanvas.width > 0 && preview.imgCanvas.height > 0);
+  }
+
+  function clearPreviewSourceImage() {
+    preview.ready = false;
+    preview.img = null;
+    preview.imgData = null;
+    preview.imgCanvas.width = 0;
+    preview.imgCanvas.height = 0;
+  }
+
+  function resetPreviewRuntimeState(reason = "") {
+    preview.worldReady = false;
+    preview.dirtyKey = "";
+    preview.view.panX = 0;
+    preview.view.panY = 0;
+    preview.view.zoom = 1.0;
+    if (reason) dbg("preview reset", reason);
+  }
+
   // -------------------- UI --------------------
   const ui = {
     toolbar: $(".toolbar"),
@@ -1383,14 +1404,14 @@ function warnMissingGlass(name) {
     if (ui.zoomPos && o.syncUi !== false) ui.zoomPos.value = String(Math.round(p * 100));
     if (o.render !== false) {
       scheduleRenderAll();
-      if (preview.ready) scheduleRenderPreview();
+      scheduleRenderPreview();
     }
     if (o.autoFocus) {
       try { autoFocus({ silent: true, render: false }); }
       catch (_) {}
       if (o.render !== false) {
         scheduleRenderAll();
-        if (preview.ready) scheduleRenderPreview();
+        scheduleRenderPreview();
       }
     }
     if (o.toast) toast(`Zoom state: ${Math.round(p * 100)}%`);
@@ -1433,6 +1454,8 @@ function warnMissingGlass(name) {
         ui.lensFocus.value = Number(lens.viewState.lensFocus).toFixed(3);
       }
 
+      resetPreviewRuntimeState("loadLens");
+
       buildTable();
       refreshGroupManagerUi("loadLens");
       applySensorToIMS();
@@ -1457,7 +1480,8 @@ function warnMissingGlass(name) {
       }
 
       const finalStats = renderAll({ source: "loadLens", allowRecovery: true }) || stats;
-      if (preview.ready) scheduleRenderPreview();
+      drawPreviewViewport();
+      scheduleRenderPreview();
 
       const stopIdx = lens.surfaces.findIndex((s) => !!s.stop);
       const s = _lastRenderStats || finalStats || evaluateCurrentRayUsability("loadLens:end");
@@ -1481,6 +1505,7 @@ function warnMissingGlass(name) {
       setStatus(`Load error: ${e?.message || e}`);
       showWarn("JSON geladen maar recovery nodig; vorige staat hersteld.");
       renderAll({ source: "loadLens_error", allowRecovery: false });
+      drawPreviewViewport();
     }
   }
 
@@ -1861,6 +1886,10 @@ function warnMissingGlass(name) {
   }
 
   function intersectSurface3D(ray, surf){
+    const INTERSECT_SHEET_TOL = 5e-4;
+    const INTERSECT_SHEET_INSIDE_TOL = 1e-7;
+    const ALLOW_LEGACY_FALLBACK_IF_NO_SHEET_HIT = true;
+
     const vx = surf.vx;
     const R = Number(surf.R || 0);
     const ap = Math.max(0, Number(surf.ap || 0));
@@ -1898,21 +1927,48 @@ function warnMissingGlass(name) {
     if (disc < 0) return null;
 
     const sdisc = Math.sqrt(disc);
-    const t1 = (-B - sdisc) / (2*A);
-    const t2 = (-B + sdisc) / (2*A);
+    const candidates = [
+      (-B - sdisc) / (2 * A),
+      (-B + sdisc) / (2 * A),
+    ];
+    let best = null;
+    let bestErr = Number.POSITIVE_INFINITY;
+    const sign = Math.sign(R) || 1;
 
-    let t = null;
-    if (t1 > 1e-9 && t2 > 1e-9) t = Math.min(t1, t2);
-    else if (t1 > 1e-9) t = t1;
-    else if (t2 > 1e-9) t = t2;
-    else return null;
+    for (const t of candidates) {
+      if (!Number.isFinite(t) || t <= 1e-9) continue;
+      const hit = add3(ray.p, mul3(ray.d, t));
+      const rr = hit.y * hit.y + hit.z * hit.z;
+      const inside = rad * rad - rr;
+      if (inside < -INTERSECT_SHEET_INSIDE_TOL) continue;
+      const expectedX = cx - sign * Math.sqrt(Math.max(0, inside));
+      const err = Math.abs(hit.x - expectedX);
+      if (err < bestErr - 1e-12 || (Math.abs(err - bestErr) <= 1e-12 && (!best || t < best.t))) {
+        bestErr = err;
+        best = { t, hit };
+      }
+    }
 
-    const hit = add3(ray.p, mul3(ray.d, t));
+    if (!best || bestErr > INTERSECT_SHEET_TOL) {
+      if (!ALLOW_LEGACY_FALLBACK_IF_NO_SHEET_HIT) return null;
+      let tLegacy = null;
+      for (const t of candidates) {
+        if (!Number.isFinite(t) || t <= 1e-9) continue;
+        if (tLegacy == null || t < tLegacy) tLegacy = t;
+      }
+      if (tLegacy == null) return null;
+      const hitLegacy = add3(ray.p, mul3(ray.d, tLegacy));
+      const rLegacy = Math.hypot(hitLegacy.y, hitLegacy.z);
+      const vignettedLegacy = rLegacy > ap + 1e-9;
+      const Nlegacy = normalize3({ x: hitLegacy.x - cx, y: hitLegacy.y, z: hitLegacy.z });
+      return { hit: hitLegacy, t: tLegacy, vignetted: vignettedLegacy, normal: Nlegacy };
+    }
+
+    const hit = best.hit;
     const r = Math.hypot(hit.y, hit.z);
     const vignetted = r > ap + 1e-9;
-
     const Nout = normalize3({ x: hit.x - cx, y: hit.y, z: hit.z });
-    return { hit, t, vignetted, normal: Nout };
+    return { hit, t: best.t, vignetted, normal: Nout };
   }
 
   function traceRayReverse3D(ray, surfaces, wavePreset){
@@ -2449,6 +2505,23 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
     previewCanvasEl._cssW = Math.max(2, r.width);
     previewCanvasEl._cssH = Math.max(2, r.height);
+  }
+
+  function ensurePreviewCanvasReady() {
+    if (!previewCanvasEl || !pctx) {
+      console.error("[viewer] preview missing: #previewCanvas or 2D context");
+      setStatus("Viewer error: preview canvas ontbreekt.");
+      showWarn("Preview canvas/context niet beschikbaar.");
+      return false;
+    }
+    resizePreviewCanvasToCSS();
+    return true;
+  }
+
+  function initPreviewUi(source = "init") {
+    resetPreviewRuntimeState(source);
+    if (!ensurePreviewCanvasReady()) return;
+    drawPreviewViewport();
   }
 
   function worldToScreen(p, world) {
@@ -2989,7 +3062,15 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     if (_rafPrev) return;
     _rafPrev = requestAnimationFrame(() => {
       _rafPrev = 0;
-      if (preview.ready) renderPreview();
+      if (!ensurePreviewCanvasReady()) return;
+      try {
+        renderPreview();
+      } catch (e) {
+        console.error("[viewer] renderPreview failed", e);
+        preview.worldReady = false;
+        showWarn(`Preview render error: ${e?.message || e}`);
+        drawPreviewViewport();
+      }
     });
   }
 
@@ -3372,62 +3453,84 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   }
 
   function drawPreviewViewport() {
-    if (!previewCanvasEl || !pctx) return;
-
-    resizePreviewCanvasToCSS();
+    if (!ensurePreviewCanvasReady()) return;
 
     const Wc = previewCanvasEl._cssW || previewCanvasEl.getBoundingClientRect().width;
     const Hc = previewCanvasEl._cssH || previewCanvasEl.getBoundingClientRect().height;
+    const sr0 = getSensorRectBaseInPane();
+    const sr = applyViewToSensorRect(sr0, preview.view);
+    const worldReady = !!(
+      preview.worldReady &&
+      preview.worldCanvas &&
+      preview.worldCanvas.width > 1 &&
+      preview.worldCanvas.height > 1
+    );
 
     pctx.clearRect(0, 0, Wc, Hc);
 
-    const hasImg = !!(preview.imgData && preview.imgCanvas.width > 0 && preview.imgCanvas.height > 0);
-    pctx.fillStyle = hasImg ? "#000" : "#fff";
+    const bg = pctx.createLinearGradient(0, 0, 0, Hc);
+    bg.addColorStop(0, "rgba(6,11,18,0.98)");
+    bg.addColorStop(1, "rgba(2,5,10,0.98)");
+    pctx.fillStyle = bg;
     pctx.fillRect(0, 0, Wc, Hc);
 
-    if (!preview.worldReady) {
-      pctx.fillStyle = "rgba(255,255,255,.65)";
-      pctx.font = "12px " + (getComputedStyle(document.documentElement).getPropertyValue("--mono") || "ui-monospace");
-      pctx.fillText("Preview: render first", 18, 24);
-      return;
+    if (worldReady) {
+      const cx = sr0.x + sr0.w * 0.5;
+      const cy = sr0.y + sr0.h * 0.5;
+
+      pctx.save();
+      pctx.imageSmoothingEnabled = true;
+      pctx.imageSmoothingQuality = "high";
+
+      pctx.beginPath();
+      pctx.rect(sr0.x, sr0.y, sr0.w, sr0.h);
+      pctx.clip();
+
+      pctx.translate(cx + preview.view.panX, cy + preview.view.panY);
+      pctx.scale(preview.view.zoom, preview.view.zoom);
+
+      pctx.drawImage(
+        preview.worldCanvas,
+        -sr0.w * 0.5, -sr0.h * 0.5,
+        sr0.w, sr0.h
+      );
+
+      pctx.restore();
     }
-
-    const sr0 = getSensorRectBaseInPane();
-
-    const cx = sr0.x + sr0.w * 0.5;
-    const cy = sr0.y + sr0.h * 0.5;
-
-    pctx.save();
-    pctx.imageSmoothingEnabled = true;
-    pctx.imageSmoothingQuality = "high";
-
-    pctx.beginPath();
-    pctx.rect(sr0.x, sr0.y, sr0.w, sr0.h);
-    pctx.clip();
-
-    pctx.translate(cx + preview.view.panX, cy + preview.view.panY);
-    pctx.scale(preview.view.zoom, preview.view.zoom);
-
-    pctx.drawImage(
-      preview.worldCanvas,
-      -sr0.w * 0.5, -sr0.h * 0.5,
-      sr0.w, sr0.h
-    );
-
-    pctx.restore();
 
     pctx.save();
     pctx.lineWidth = 1;
     pctx.strokeStyle = "rgba(255,255,255,.20)";
     pctx.strokeRect(sr0.x, sr0.y, sr0.w, sr0.h);
 
-    const sr = applyViewToSensorRect(sr0, preview.view);
     pctx.strokeStyle = "rgba(42,110,242,.55)";
     pctx.strokeRect(sr.x, sr.y, sr.w, sr.h);
 
-    // --- diagonal ruler (toggle) ---
     if (preview.rulerOn) drawPreviewDiagonalRuler(sr);
     pctx.restore();
+
+    if (!worldReady) {
+      const hasImg = hasPreviewSourceImage();
+      const mono = (getComputedStyle(document.documentElement).getPropertyValue("--mono") || "ui-monospace").trim();
+      const lines = hasImg
+        ? ["Preview bezig of nog niet gerenderd.", "Wacht even of klik op Render Preview."]
+        : ["Geen preview image geladen.", "Laad een image om preview mapping te zien."];
+
+      pctx.save();
+      pctx.fillStyle = "rgba(0,0,0,.55)";
+      pctx.fillRect(sr0.x, sr0.y, sr0.w, sr0.h);
+      pctx.fillStyle = "rgba(255,255,255,.88)";
+      pctx.textAlign = "center";
+      pctx.textBaseline = "middle";
+      pctx.font = `12px ${mono}`;
+      const centerX = sr0.x + sr0.w * 0.5;
+      const centerY = sr0.y + sr0.h * 0.5;
+      const gap = 18;
+      pctx.fillText(lines[0], centerX, centerY - gap * 0.5);
+      pctx.fillStyle = "rgba(255,255,255,.70)";
+      pctx.fillText(lines[1], centerX, centerY + gap * 0.5);
+      pctx.restore();
+    }
   }
 
   // ==========================
@@ -4398,6 +4501,14 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     // Build LUT in chunks (prevents freezing)
     let k = 0;
     const kPerFrame = (q === "hq") ? 18 : (q === "draft" ? 40 : 26);
+    const lutDiag = {
+      chiefOk: 0,
+      chiefFail: 0,
+      chief2dFallback: 0,
+      pupilOk: 0,
+      pupilTotal: 0,
+      transFloorFallback: 0,
+    };
 
     function buildStep() {
       const end = Math.min(LUT_N, k + kPerFrame);
@@ -4412,6 +4523,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
         for (let ch = 0; ch < 3; ch++) {
           const wave = WAVES[ch];
+          let chiefOk = false;
 
           // chief ray -> object radius
           {
@@ -4419,8 +4531,26 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
             const trC = traceRayReverse3D({ p: pS, d: dirChief }, lens.surfaces, wave);
             if (!trC.vignetted && !trC.tir) {
               const hitObj = intersectPlaneX3D(trC.endRay, xObjPlane);
-              rObjLUT[ch][k] = hitObj ? Math.hypot(hitObj.y, hitObj.z) : 0;
-            } else {
+              if (hitObj) {
+                rObjLUT[ch][k] = Math.hypot(hitObj.y, hitObj.z);
+                chiefOk = true;
+              }
+            }
+            if (!chiefOk) {
+              const dirChief2D = normalize({ x: xStop - startX, y: -rS });
+              const tr2D = traceRayReverse({ p: { x: startX, y: rS }, d: dirChief2D }, lens.surfaces, wave);
+              if (tr2D && !tr2D.vignetted && !tr2D.tir) {
+                const hitObj2D = intersectPlaneX(tr2D.endRay, xObjPlane);
+                if (hitObj2D) {
+                  rObjLUT[ch][k] = Math.abs(hitObj2D.y);
+                  chiefOk = true;
+                  lutDiag.chief2dFallback++;
+                }
+              }
+            }
+            if (chiefOk) lutDiag.chiefOk++;
+            else {
+              lutDiag.chiefFail++;
               rObjLUT[ch][k] = 0;
             }
           }
@@ -4440,12 +4570,14 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
               const tr = traceRayReverse3D({ p: pS, d: dir }, lens.surfaces, wave);
               total++;
+              lutDiag.pupilTotal++;
               if (tr.vignetted || tr.tir) continue;
 
               const hitObj = intersectPlaneX3D(tr.endRay, xObjPlane);
               if (!hitObj) continue;
 
               ok++;
+              lutDiag.pupilOk++;
               sumY += hitObj.y; sumZ += hitObj.z;
               sumYY += hitObj.y * hitObj.y;
               sumZZ += hitObj.z * hitObj.z;
@@ -4453,6 +4585,10 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
           }
 
           transLUT[ch][k] = total ? (ok / total) : 0;
+          if (ok === 0 && chiefOk && rObjLUT[ch][k] > 0) {
+            transLUT[ch][k] = Math.max(transLUT[ch][k], 0.08);
+            lutDiag.transFloorFallback++;
+          }
 
           if (ok > 2) {
             const my = sumY / ok, mz = sumZ / ok;
@@ -4470,6 +4606,22 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         return;
       }
 
+      if (lutDiag.chiefOk <= 0 || lutDiag.pupilOk <= 0) {
+        console.warn("[viewer] preview LUT weak for current lens state", {
+          chiefOk: lutDiag.chiefOk,
+          chiefFail: lutDiag.chiefFail,
+          chief2dFallback: lutDiag.chief2dFallback,
+          pupilOk: lutDiag.pupilOk,
+          pupilTotal: lutDiag.pupilTotal,
+          transFloorFallback: lutDiag.transFloorFallback,
+          focusMode,
+          lensShift,
+          sensorX,
+          zoomPos: Number(ui.zoomPos?.value || 0),
+        });
+        showWarn("Preview recovery actief: beperkte reverse traces, fallback gebruikt.");
+      }
+
       setUsableCircleFromLUT(transLUT[1], naturalLUT, rMaxSensor);
 
       // Allocate world canvas AFTER LUT is ready
@@ -4480,6 +4632,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
       const out = wctx.createImageData(W, H);
       const outD = out.data;
+      let litPx = 0;
 
       function objXY(L, sx, sy, rS) {
         if (rS <= 1e-9) return { ox: 0, oy: 0 };
@@ -4503,6 +4656,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
               outD[idx] = 0; outD[idx + 1] = 0; outD[idx + 2] = 0; outD[idx + 3] = 255;
               continue;
             }
+            litPx++;
 
             const p = objXY(L, sx, sy, rS);
             const uv0 = objectMmToUV(p.ox, p.oy);
@@ -4545,6 +4699,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
             outD[idx] = 0; outD[idx + 1] = 0; outD[idx + 2] = 0; outD[idx + 3] = 255;
             continue;
           }
+          litPx++;
 
           function chanSample(L, sx, sy, rS, chGain, chIndex){
             const p = objXY(L, sx, sy, rS);
@@ -4577,7 +4732,14 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       setUsableCircleFromRenderedPixels(outD, W, H, sensorW, sensorH);
 
       wctx.putImageData(out, 0, 0);
-      preview.worldReady = true;
+      const litRatio = (W * H) > 0 ? (litPx / (W * H)) : 0;
+      if (litRatio < 0.001) {
+        preview.worldReady = false;
+        console.warn("[viewer] preview output almost black", { litPx, W, H, litRatio });
+        showWarn("Preview bijna volledig zwart; probeer autofocus/zoom of andere image.");
+      } else {
+        preview.worldReady = true;
+      }
       hidePreviewProgress();
       drawPreviewViewport();
     }
@@ -4856,8 +5018,8 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   async function togglePreviewFullscreen() {
     await togglePaneFullscreen(ui.previewPane);
     setTimeout(() => {
-      resizePreviewCanvasToCSS();
-      if (preview.ready) scheduleRenderPreview();
+      ensurePreviewCanvasReady();
+      scheduleRenderPreview();
     }, 50);
   }
 
@@ -4888,13 +5050,19 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         const id = preview.imgCtx.getImageData(0, 0, preview.imgCanvas.width, preview.imgCanvas.height);
         preview.imgData = id.data;
         preview.ready = true;
+        preview.worldReady = false;
+        preview.dirtyKey = "";
 
         setFooterWarn(`Preview image loaded: ${preview.imgCanvas.width}×${preview.imgCanvas.height}`);
+        drawPreviewViewport();
         scheduleRenderPreview();
         resolve(true);
       };
       img.onerror = (e) => {
+        clearPreviewSourceImage();
+        preview.worldReady = false;
         setFooterWarn(`Preview image load failed: ${url}`);
+        drawPreviewViewport();
         reject(e);
       };
       img.src = url + (url.includes("?") ? "&" : "?") + "t=" + Date.now();
@@ -5022,7 +5190,7 @@ function wireUI() {
       updateZoomReadouts();
       applyZoomState(num(ui.zoomPos?.value, 0) / 100, { render: false, syncUi: false, autoFocus: false });
       scheduleRenderAll();
-      if (preview.ready) scheduleRenderPreview();
+      scheduleRenderPreview();
     });
   });
   if (ui.zoomPos) {
@@ -5135,7 +5303,8 @@ function wireUI() {
     resizeCanvasToCSS();
     resizePreviewCanvasToCSS();
     renderAll();
-    if (preview.ready) scheduleRenderPreview();
+    drawPreviewViewport();
+    scheduleRenderPreview();
   });
 }
 
@@ -5146,6 +5315,7 @@ function boot() {
   wireUI();
   bindViewControls();
   bindPreviewViewControls();
+  initPreviewUi("boot");
 
   if (!canvas || !ctx) {
     console.error("[viewer] init failed: missing #canvas or 2D context");
@@ -5170,6 +5340,7 @@ function boot() {
   updateZoomReadouts();
   applyZoomState(num(lens?.zoomConfig?.pos, 0), { render: false, syncUi: true, autoFocus: false });
   renderAll();
+  scheduleRenderPreview();
 
   // load default assets (non-blocking)
   loadPreviewImageFromURL(DEFAULT_PREVIEW_URL).catch(() => {});
