@@ -61,15 +61,20 @@
     worldCanvas: document.createElement("canvas"),
     worldCtx: null,
     worldReady: false,
+    renderPending: false,
     dirtyKey: "",
     lastRenderFailed: false,
     lastRenderFailReason: "",
     lastRenderDiag: null,
     lastRenderWasStale: false,
+    lastRenderAttemptState: null,
+    lastRenderAttemptAt: 0,
 
     lastValidCanvas: document.createElement("canvas"),
     lastValidCtx: null,
     lastValidReady: false,
+    lastValidState: null,
+    lastValidAt: 0,
 
     view: { panX: 0, panY: 0, zoom: 1.0, dragging: false, lastX: 0, lastY: 0 },
 
@@ -163,12 +168,17 @@
 
   function resetPreviewRuntimeState(reason = "") {
     preview.worldReady = false;
+    preview.renderPending = false;
     preview.dirtyKey = "";
     preview.lastRenderFailed = false;
     preview.lastRenderFailReason = "";
     preview.lastRenderDiag = null;
     preview.lastRenderWasStale = false;
+    preview.lastRenderAttemptState = null;
+    preview.lastRenderAttemptAt = 0;
     preview.lastValidReady = false;
+    preview.lastValidState = null;
+    preview.lastValidAt = 0;
     preview.lastValidCanvas.width = 0;
     preview.lastValidCanvas.height = 0;
     preview.view.panX = 0;
@@ -181,8 +191,45 @@
     preview.lastRenderDiag = diag && typeof diag === "object" ? clone(diag) : null;
   }
 
+  function buildPreviewStateSummary(extra = null) {
+    const focusState = getRuntimeFocusState();
+    const out = {
+      zoomPos: Number(ui.zoomPos?.value || 0),
+      focusMode: focusState.focusMode,
+      sensorOffset: Number(ui.sensorOffset?.value || 0),
+      lensFocus: Number(ui.lensFocus?.value || 0),
+      sensorX: Number(focusState.sensorX || 0),
+      lensShift: Number(focusState.lensShift || 0),
+    };
+    if (extra && typeof extra === "object") Object.assign(out, extra);
+    return out;
+  }
+
+  function diffPreviewStates(a, b) {
+    const aa = a && typeof a === "object" ? a : {};
+    const bb = b && typeof b === "object" ? b : {};
+    const keys = ["zoomPos", "focusMode", "sensorOffset", "lensFocus", "sensorX", "lensShift", "selectedStateTag"];
+    const diff = {};
+    for (const k of keys) {
+      if (!Object.prototype.hasOwnProperty.call(aa, k) && !Object.prototype.hasOwnProperty.call(bb, k)) continue;
+      const av = aa[k];
+      const bv = bb[k];
+      if (typeof av === "number" || typeof bv === "number") {
+        const an = Number(av);
+        const bn = Number(bv);
+        if (!Number.isFinite(an) || !Number.isFinite(bn) || Math.abs(an - bn) > 1e-6) {
+          diff[k] = { lastValid: av, current: bv };
+        }
+      } else if (String(av) !== String(bv)) {
+        diff[k] = { lastValid: av, current: bv };
+      }
+    }
+    return diff;
+  }
+
   function markPreviewFailure(reason, diag = null) {
     preview.worldReady = false;
+    preview.renderPending = false;
     preview.lastRenderFailed = true;
     preview.lastRenderFailReason = String(reason || "unknown");
     preview.lastRenderWasStale = false;
@@ -191,13 +238,14 @@
 
   function markPreviewSuccess(diag = null) {
     preview.worldReady = true;
+    preview.renderPending = false;
     preview.lastRenderFailed = false;
     preview.lastRenderFailReason = "";
     preview.lastRenderWasStale = false;
     setPreviewDiag(diag);
   }
 
-  function snapshotPreviewAsLastValid() {
+  function snapshotPreviewAsLastValid(stateMeta = null) {
     if (!preview.worldCanvas || preview.worldCanvas.width < 2 || preview.worldCanvas.height < 2) return false;
     if (!preview.lastValidCtx) preview.lastValidCtx = preview.lastValidCanvas.getContext("2d");
     preview.lastValidCanvas.width = preview.worldCanvas.width;
@@ -206,6 +254,17 @@
     preview.lastValidCtx.clearRect(0, 0, preview.lastValidCanvas.width, preview.lastValidCanvas.height);
     preview.lastValidCtx.drawImage(preview.worldCanvas, 0, 0);
     preview.lastValidReady = true;
+    preview.lastValidAt = Date.now();
+    preview.lastValidState = buildPreviewStateSummary(stateMeta && typeof stateMeta === "object" ? stateMeta : null);
+    if (DEBUG_VIEWER) {
+      const currentState = buildPreviewStateSummary(preview.lastRenderAttemptState || null);
+      console.log("[viewer] snapshotPreviewAsLastValid", {
+        at: new Date(preview.lastValidAt).toISOString(),
+        state: preview.lastValidState,
+        currentState,
+        currentVsLastValid: diffPreviewStates(preview.lastValidState, currentState),
+      });
+    }
     return true;
   }
 
@@ -3833,13 +3892,17 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
       if (!worldReady && staleReady) {
         pctx.save();
-        pctx.fillStyle = "rgba(6,10,18,.44)";
+        pctx.fillStyle = "rgba(2,4,10,.72)";
         pctx.fillRect(sr0.x, sr0.y, sr0.w, sr0.h);
-        pctx.fillStyle = "rgba(255,194,46,.95)";
-        pctx.textAlign = "left";
-        pctx.textBaseline = "top";
-        pctx.font = "11px " + (getComputedStyle(document.documentElement).getPropertyValue("--mono") || "ui-monospace").trim();
-        pctx.fillText("STALE PREVIEW", sr0.x + 10, sr0.y + 10);
+        const mono = (getComputedStyle(document.documentElement).getPropertyValue("--mono") || "ui-monospace").trim();
+        pctx.textAlign = "center";
+        pctx.textBaseline = "middle";
+        pctx.font = `bold 13px ${mono}`;
+        pctx.fillStyle = "rgba(255,194,46,.98)";
+        pctx.fillText("OLD PREVIEW", sr0.x + sr0.w * 0.5, sr0.y + sr0.h * 0.5 - 11);
+        pctx.font = `11px ${mono}`;
+        pctx.fillStyle = "rgba(255,220,160,.92)";
+        pctx.fillText("CURRENT ZOOM RENDER FAILED", sr0.x + sr0.w * 0.5, sr0.y + sr0.h * 0.5 + 9);
         pctx.restore();
       }
     }
@@ -3875,6 +3938,9 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         if (preview.lastRenderWasStale) {
           lines.push("Stale preview shown (last valid frame).");
         }
+      } else if (preview.renderPending) {
+        lines.push("Preview render bezig voor huidige zoom/focus state.");
+        lines.push("Wacht tot de nieuwe render klaar is.");
       } else if (hasImg) {
         lines.push("Preview bezig of nog niet gerenderd.");
         lines.push("Wacht even of klik op Render Preview.");
@@ -3917,9 +3983,9 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
     const box = {
       x: sr0.x + 12,
-      y: sr0.y + sr0.h - 92,
+      y: sr0.y + sr0.h - 114,
       w: Math.max(180, sr0.w - 24),
-      h: 80,
+      h: 102,
     };
     pctx.save();
     pctx.fillStyle = "rgba(0,0,0,.62)";
@@ -3970,6 +4036,17 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     const sub2 = `fallback2D chief ${diag.chief2dFallback || 0} • pupil ${diag.pupil2dFallback || 0}`;
     pctx.fillStyle = "rgba(255,255,255,.56)";
     pctx.fillText(sub2, box.x + 8, box.y + 35);
+    const cur = preview.lastRenderAttemptState || {};
+    const last = preview.lastValidState || {};
+    const curTxt = `CURRENT z${Number(cur.zoomPos || 0).toFixed(1)}% • ${cur.focusMode || "?"} • LF ${Number(cur.lensFocus || 0).toFixed(2)} • SO ${Number(cur.sensorOffset || 0).toFixed(2)} • tag ${cur.selectedStateTag || "?"}`;
+    const lastTxt = `LAST z${Number(last.zoomPos || 0).toFixed(1)}% • ${last.focusMode || "?"} • LF ${Number(last.lensFocus || 0).toFixed(2)} • SO ${Number(last.sensorOffset || 0).toFixed(2)} • stale ${preview.lastRenderWasStale ? "YES" : "NO"}`;
+    const geoTxt = `launch x ${Number(diag.startX || 0).toFixed(2)} -> stop x ${Number(diag.xStop || 0).toFixed(2)} -> obj x ${Number(diag.xObjPlane || 0).toFixed(1)}`;
+    pctx.fillStyle = "rgba(255,255,255,.60)";
+    pctx.fillText(curTxt, box.x + 8, box.y + 47);
+    pctx.fillStyle = "rgba(255,255,255,.52)";
+    pctx.fillText(lastTxt, box.x + 8, box.y + 58);
+    pctx.fillStyle = "rgba(255,255,255,.46)";
+    pctx.fillText(geoTxt, box.x + 8, box.y + 69);
     pctx.fillStyle = "rgba(255,194,46,.95)";
     pctx.fillText("chief", box.x + 8, box.y + box.h - 6);
     pctx.fillStyle = "rgba(79,150,255,.95)";
@@ -4814,13 +4891,17 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     }
   }
 
- function renderPreview() {
+function renderPreview() {
   if (!pctx || !previewCanvasEl) return;
   if (!preview.worldCtx) preview.worldCtx = preview.worldCanvas.getContext("2d");
   setNoUsableCircle("pending");
-  preview.lastRenderFailed = false;
-  preview.lastRenderFailReason = "";
-  preview.lastRenderWasStale = false;
+  preview.renderPending = true;
+  preview.lastRenderAttemptAt = Date.now();
+  preview.lastRenderAttemptState = buildPreviewStateSummary({
+    selectedStateTag: "pending",
+    choiceUsedFallback: false,
+    strictGeometry: false,
+  });
 
   const doDOF = !!document.getElementById("optDOF")?.checked;
   const doCA  = !!document.getElementById("optCA")?.checked;
@@ -4893,6 +4974,15 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   const xStop = Number(stopSurf?.vx || 0);
   const stopAp = Math.max(1e-6, Number(stopSurf?.ap || 0));
   const xObjPlane = Number(selectedState.xObjPlane || ((previewSurfaces[0]?.vx ?? 0) - objDist));
+  preview.lastRenderAttemptState = buildPreviewStateSummary({
+    selectedStateTag: String(selectedState.tag || "current"),
+    choiceUsedFallback: !!choice?.usedFallback,
+    strictGeometry: !!choice?.strictGeometry,
+    stopIdx,
+    xStop,
+    stopAp,
+    xObjPlane,
+  });
   if (DEBUG_VIEWER) {
     const raysRef = buildRenderStateSnapshot("drawRays-ref", lens.surfaces, focusModeUi, lensShiftUi, sensorXUi, {
       source: "renderPreview",
@@ -4908,6 +4998,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       strictGeometrySource: String(_lastRenderGeometry?.source || ""),
       selectedScore: Number(selectedState?.score || 0),
     });
+    const stateDiff = diffPreviewStates(preview.lastValidState, preview.lastRenderAttemptState);
     console.groupCollapsed("[viewer-state] previewReverse");
     console.log("drawRaysRef", raysRef);
     console.log(snap);
@@ -4921,6 +5012,21 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       sensorX: Number(c?.sensorX || 0),
       lensShift: Number(c?.lensShift || 0),
     })));
+    console.log("previewAttempt", {
+      zoomPos: Number(ui.zoomPos?.value || 0),
+      focusModeUi,
+      sensorXUi,
+      lensShiftUi,
+      selectedStateTag: String(selectedState.tag || "current"),
+      choiceUsedFallback: !!choice?.usedFallback,
+      strictGeometry: !!choice?.strictGeometry,
+      stopIdx,
+      xStop,
+      stopAp,
+      xObjPlane,
+      lastValidState: preview.lastValidState || null,
+      currentVsLastValid: stateDiff,
+    });
     console.groupEnd();
   }
 
@@ -5447,7 +5553,46 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         }
       } else {
         markPreviewSuccess(diagPayload);
-        snapshotPreviewAsLastValid();
+        snapshotPreviewAsLastValid({
+          selectedStateTag: String(selectedState.tag || "current"),
+          choiceUsedFallback: !!choice?.usedFallback,
+          strictGeometry: !!choice?.strictGeometry,
+          stopIdx,
+          xStop,
+          stopAp,
+          xObjPlane,
+        });
+      }
+      if (DEBUG_VIEWER) {
+        const currentState = preview.lastRenderAttemptState || buildPreviewStateSummary({ selectedStateTag: String(selectedState.tag || "current") });
+        const lastValidDiff = diffPreviewStates(preview.lastValidState, currentState);
+        console.groupCollapsed("[viewer] renderPreview result");
+        console.log({
+          mode: "lut",
+          zoomPos: Number(ui.zoomPos?.value || 0),
+          focusModeUi,
+          sensorXUi,
+          lensShiftUi,
+          selectedStateTag: String(selectedState.tag || "current"),
+          choiceUsedFallback: !!choice?.usedFallback,
+          strictGeometry: !!choice?.strictGeometry,
+          stopIdx,
+          xStop,
+          stopAp,
+          xObjPlane,
+          chiefOk: Number(diagPayload.chiefOk || 0),
+          chiefTotal: Number(diagPayload.chiefTotal || 0),
+          pupilOk: Number(diagPayload.pupilOk || 0),
+          pupilTotal: Number(diagPayload.pupilTotal || 0),
+          litRatio: Number(diagPayload.litRatio || 0),
+          failReason: String(diagPayload.failReason || ""),
+          chiefLaunchSamples: diagPayload.chiefLaunchSamples || [],
+          pupilLaunchSamples: diagPayload.pupilLaunchSamples || [],
+          lastValidState: preview.lastValidState || null,
+          currentState,
+          currentVsLastValid: lastValidDiff,
+        });
+        console.groupEnd();
       }
       hidePreviewProgress();
       drawPreviewViewport();
@@ -5553,8 +5698,6 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       wctx.putImageData(out, 0, 0);
       if (row < H) {
         preview.worldReady = true;
-        preview.lastRenderFailed = false;
-        preview.lastRenderWasStale = false;
       } else {
         const litRatio = (W * H) > 0 ? (litPx / (W * H)) : 0;
         const diagPayload = {
@@ -5588,7 +5731,44 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
           }
         } else {
           markPreviewSuccess(diagPayload);
-          snapshotPreviewAsLastValid();
+          snapshotPreviewAsLastValid({
+            selectedStateTag: String(selectedState.tag || "current"),
+            choiceUsedFallback: !!choice?.usedFallback,
+            strictGeometry: !!choice?.strictGeometry,
+            stopIdx,
+            xStop,
+            stopAp,
+            xObjPlane,
+          });
+        }
+        if (DEBUG_VIEWER) {
+          const currentState = preview.lastRenderAttemptState || buildPreviewStateSummary({ selectedStateTag: String(selectedState.tag || "current") });
+          const lastValidDiff = diffPreviewStates(preview.lastValidState, currentState);
+          console.groupCollapsed("[viewer] renderPreview result");
+          console.log({
+            mode: "dof",
+            zoomPos: Number(ui.zoomPos?.value || 0),
+            focusModeUi,
+            sensorXUi,
+            lensShiftUi,
+            selectedStateTag: String(selectedState.tag || "current"),
+            choiceUsedFallback: !!choice?.usedFallback,
+            strictGeometry: !!choice?.strictGeometry,
+            stopIdx,
+            xStop,
+            stopAp,
+            xObjPlane,
+            chiefOk: Number(diagPayload.chiefOk || 0),
+            chiefTotal: Number(diagPayload.chiefTotal || 0),
+            pupilOk: Number(diagPayload.pupilOk || 0),
+            pupilTotal: Number(diagPayload.pupilTotal || 0),
+            litRatio: Number(diagPayload.litRatio || 0),
+            failReason: String(diagPayload.failReason || ""),
+            lastValidState: preview.lastValidState || null,
+            currentState,
+            currentVsLastValid: lastValidDiff,
+          });
+          console.groupEnd();
         }
       }
       drawPreviewViewport();
