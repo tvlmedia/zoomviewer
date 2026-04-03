@@ -62,6 +62,14 @@
     worldCtx: null,
     worldReady: false,
     dirtyKey: "",
+    lastRenderFailed: false,
+    lastRenderFailReason: "",
+    lastRenderDiag: null,
+    lastRenderWasStale: false,
+
+    lastValidCanvas: document.createElement("canvas"),
+    lastValidCtx: null,
+    lastValidReady: false,
 
     view: { panX: 0, panY: 0, zoom: 1.0, dragging: false, lastX: 0, lastY: 0 },
 
@@ -78,9 +86,13 @@
       source: "",
     },
     lastFocusFallbackSig: "",
+    debugOverlay: /(?:\?|&)previewDebug=1(?:&|$)/.test(window.location.search),
   };
   preview.imgCtx = preview.imgCanvas.getContext("2d");
   preview.worldCtx = preview.worldCanvas.getContext("2d");
+  preview.lastValidCtx = preview.lastValidCanvas.getContext("2d");
+
+  const MIN_RENDER_LIT_RATIO = 0.001;
 
   const DEBUG_VIEWER = true;
   const dbg = (...args) => { if (DEBUG_VIEWER) console.log("[viewer]", ...args); };
@@ -150,10 +162,49 @@
   function resetPreviewRuntimeState(reason = "") {
     preview.worldReady = false;
     preview.dirtyKey = "";
+    preview.lastRenderFailed = false;
+    preview.lastRenderFailReason = "";
+    preview.lastRenderDiag = null;
+    preview.lastRenderWasStale = false;
+    preview.lastValidReady = false;
+    preview.lastValidCanvas.width = 0;
+    preview.lastValidCanvas.height = 0;
     preview.view.panX = 0;
     preview.view.panY = 0;
     preview.view.zoom = 1.0;
     if (reason) dbg("preview reset", reason);
+  }
+
+  function setPreviewDiag(diag = null) {
+    preview.lastRenderDiag = diag && typeof diag === "object" ? clone(diag) : null;
+  }
+
+  function markPreviewFailure(reason, diag = null) {
+    preview.worldReady = false;
+    preview.lastRenderFailed = true;
+    preview.lastRenderFailReason = String(reason || "unknown");
+    preview.lastRenderWasStale = false;
+    setPreviewDiag(diag);
+  }
+
+  function markPreviewSuccess(diag = null) {
+    preview.worldReady = true;
+    preview.lastRenderFailed = false;
+    preview.lastRenderFailReason = "";
+    preview.lastRenderWasStale = false;
+    setPreviewDiag(diag);
+  }
+
+  function snapshotPreviewAsLastValid() {
+    if (!preview.worldCanvas || preview.worldCanvas.width < 2 || preview.worldCanvas.height < 2) return false;
+    if (!preview.lastValidCtx) preview.lastValidCtx = preview.lastValidCanvas.getContext("2d");
+    preview.lastValidCanvas.width = preview.worldCanvas.width;
+    preview.lastValidCanvas.height = preview.worldCanvas.height;
+    preview.lastValidCtx.setTransform(1, 0, 0, 1, 0, 0);
+    preview.lastValidCtx.clearRect(0, 0, preview.lastValidCanvas.width, preview.lastValidCanvas.height);
+    preview.lastValidCtx.drawImage(preview.worldCanvas, 0, 0);
+    preview.lastValidReady = true;
+    return true;
   }
 
   // -------------------- UI --------------------
@@ -3195,7 +3246,14 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         renderPreview();
       } catch (e) {
         console.error("[viewer] renderPreview failed", e);
-        preview.worldReady = false;
+        markPreviewFailure(`exception: ${e?.message || e}`, {
+          mode: "exception",
+          failReason: String(e?.message || e),
+          zoomPos: Number(ui.zoomPos?.value || 0),
+          focusMode: String(ui.focusMode?.value || "cam"),
+          lensShift: Number(ui.lensFocus?.value || 0),
+          sensorX: Number(ui.sensorOffset?.value || 0),
+        });
         showWarn(`Preview render error: ${e?.message || e}`);
         drawPreviewViewport();
       }
@@ -3593,6 +3651,13 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       preview.worldCanvas.width > 1 &&
       preview.worldCanvas.height > 1
     );
+    const staleReady = !!(
+      !worldReady &&
+      preview.lastValidReady &&
+      preview.lastValidCanvas &&
+      preview.lastValidCanvas.width > 1 &&
+      preview.lastValidCanvas.height > 1
+    );
 
     pctx.clearRect(0, 0, Wc, Hc);
 
@@ -3602,9 +3667,10 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     pctx.fillStyle = bg;
     pctx.fillRect(0, 0, Wc, Hc);
 
-    if (worldReady) {
+    if (worldReady || staleReady) {
       const cx = sr0.x + sr0.w * 0.5;
       const cy = sr0.y + sr0.h * 0.5;
+      const srcCanvas = worldReady ? preview.worldCanvas : preview.lastValidCanvas;
 
       pctx.save();
       pctx.imageSmoothingEnabled = true;
@@ -3618,12 +3684,24 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       pctx.scale(preview.view.zoom, preview.view.zoom);
 
       pctx.drawImage(
-        preview.worldCanvas,
+        srcCanvas,
         -sr0.w * 0.5, -sr0.h * 0.5,
         sr0.w, sr0.h
       );
 
       pctx.restore();
+
+      if (!worldReady && staleReady) {
+        pctx.save();
+        pctx.fillStyle = "rgba(6,10,18,.44)";
+        pctx.fillRect(sr0.x, sr0.y, sr0.w, sr0.h);
+        pctx.fillStyle = "rgba(255,194,46,.95)";
+        pctx.textAlign = "left";
+        pctx.textBaseline = "top";
+        pctx.font = "11px " + (getComputedStyle(document.documentElement).getPropertyValue("--mono") || "ui-monospace").trim();
+        pctx.fillText("STALE PREVIEW", sr0.x + 10, sr0.y + 10);
+        pctx.restore();
+      }
     }
 
     pctx.save();
@@ -3640,9 +3718,30 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     if (!worldReady) {
       const hasImg = hasPreviewSourceImage();
       const mono = (getComputedStyle(document.documentElement).getPropertyValue("--mono") || "ui-monospace").trim();
-      const lines = hasImg
-        ? ["Preview bezig of nog niet gerenderd.", "Wacht even of klik op Render Preview."]
-        : ["Geen preview image geladen.", "Laad een image om preview mapping te zien."];
+      const diag = preview.lastRenderDiag || null;
+      const lines = [];
+      if (preview.lastRenderFailed) {
+        lines.push("Preview render failed: reverse map too weak for current zoom state.");
+        const chiefTxt = Number.isFinite(diag?.chiefOk) && Number.isFinite(diag?.chiefTotal)
+          ? `chief ${diag.chiefOk}/${diag.chiefTotal}`
+          : "chief —";
+        const pupilTxt = Number.isFinite(diag?.pupilOk) && Number.isFinite(diag?.pupilTotal)
+          ? `pupil ${diag.pupilOk}/${diag.pupilTotal}`
+          : "pupil —";
+        lines.push(`${chiefTxt} • ${pupilTxt}`);
+        if (Number.isFinite(diag?.zoomPos)) {
+          lines.push(`zoom ${diag.zoomPos}% • focus ${diag?.focusMode || "?"} • lens ${Number(diag?.lensShift || 0).toFixed(2)} • sensor ${Number(diag?.sensorX || 0).toFixed(2)}`);
+        }
+        if (preview.lastRenderWasStale) {
+          lines.push("Stale preview shown (last valid frame).");
+        }
+      } else if (hasImg) {
+        lines.push("Preview bezig of nog niet gerenderd.");
+        lines.push("Wacht even of klik op Render Preview.");
+      } else {
+        lines.push("Geen preview image geladen.");
+        lines.push("Laad een image om preview mapping te zien.");
+      }
 
       pctx.save();
       pctx.fillStyle = "rgba(0,0,0,.55)";
@@ -3653,12 +3752,83 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       pctx.font = `12px ${mono}`;
       const centerX = sr0.x + sr0.w * 0.5;
       const centerY = sr0.y + sr0.h * 0.5;
-      const gap = 18;
-      pctx.fillText(lines[0], centerX, centerY - gap * 0.5);
-      pctx.fillStyle = "rgba(255,255,255,.70)";
-      pctx.fillText(lines[1], centerX, centerY + gap * 0.5);
+      const gap = 17;
+      const totalH = (lines.length - 1) * gap;
+      const y0 = centerY - totalH * 0.5;
+      for (let i = 0; i < lines.length; i++) {
+        pctx.fillStyle = i === 0 ? "rgba(255,255,255,.88)" : "rgba(255,255,255,.70)";
+        pctx.fillText(lines[i], centerX, y0 + i * gap);
+      }
       pctx.restore();
     }
+
+    if (preview.debugOverlay && preview.lastRenderDiag) {
+      drawPreviewDebugOverlay(sr0, preview.lastRenderDiag);
+    }
+  }
+
+  function drawPreviewDebugOverlay(sr0, diag) {
+    if (!pctx || !sr0 || !diag) return;
+    const arrChief = Array.isArray(diag?.chiefCurve) ? diag.chiefCurve : [];
+    const arrTrans = Array.isArray(diag?.transCurve) ? diag.transCurve : [];
+    const arrHeat = Array.isArray(diag?.heatCurve) ? diag.heatCurve : [];
+    const n = Math.max(arrChief.length, arrTrans.length, arrHeat.length);
+    if (n < 2) return;
+
+    const box = {
+      x: sr0.x + 12,
+      y: sr0.y + sr0.h - 92,
+      w: Math.max(180, sr0.w - 24),
+      h: 80,
+    };
+    pctx.save();
+    pctx.fillStyle = "rgba(0,0,0,.62)";
+    pctx.strokeStyle = "rgba(255,255,255,.20)";
+    pctx.lineWidth = 1;
+    pctx.fillRect(box.x, box.y, box.w, box.h);
+    pctx.strokeRect(box.x, box.y, box.w, box.h);
+
+    if (arrHeat.length >= 2) {
+      for (let i = 0; i < arrHeat.length; i++) {
+        const t = arrHeat.length > 1 ? (i / (arrHeat.length - 1)) : 0;
+        const x = box.x + t * box.w;
+        const v = Math.max(0, Math.min(1, Number(arrHeat[i] || 0)));
+        pctx.strokeStyle = `rgba(${Math.round(220 * (1 - v))},${Math.round(190 * v)},64,0.45)`;
+        pctx.beginPath();
+        pctx.moveTo(x, box.y + box.h - 1);
+        pctx.lineTo(x, box.y + box.h - 16);
+        pctx.stroke();
+      }
+    }
+
+    const drawCurve = (arr, color) => {
+      if (!Array.isArray(arr) || arr.length < 2) return;
+      pctx.strokeStyle = color;
+      pctx.lineWidth = 1.5;
+      pctx.beginPath();
+      for (let i = 0; i < arr.length; i++) {
+        const t = arr.length > 1 ? (i / (arr.length - 1)) : 0;
+        const x = box.x + t * box.w;
+        const v = Math.max(0, Math.min(1, Number(arr[i] || 0)));
+        const y = box.y + box.h - 18 - v * (box.h - 24);
+        if (i === 0) pctx.moveTo(x, y);
+        else pctx.lineTo(x, y);
+      }
+      pctx.stroke();
+    };
+
+    drawCurve(arrChief, "rgba(255,194,46,.95)");
+    drawCurve(arrTrans, "rgba(79,150,255,.95)");
+
+    pctx.fillStyle = "rgba(255,255,255,.86)";
+    pctx.font = "10px " + (getComputedStyle(document.documentElement).getPropertyValue("--mono") || "ui-monospace").trim();
+    const hdr = `DBG chief ${diag.chiefOk || 0}/${diag.chiefTotal || 0} • pupil ${diag.pupilOk || 0}/${diag.pupilTotal || 0} • lit ${(100 * Number(diag.litRatio || 0)).toFixed(2)}%`;
+    pctx.fillText(hdr, box.x + 8, box.y + 12);
+    pctx.fillStyle = "rgba(255,194,46,.95)";
+    pctx.fillText("chief", box.x + 8, box.y + box.h - 6);
+    pctx.fillStyle = "rgba(79,150,255,.95)";
+    pctx.fillText("trans", box.x + 54, box.y + box.h - 6);
+    pctx.restore();
   }
 
   // ==========================
@@ -4502,6 +4672,9 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   if (!pctx || !previewCanvasEl) return;
   if (!preview.worldCtx) preview.worldCtx = preview.worldCanvas.getContext("2d");
   setNoUsableCircle("pending");
+  preview.lastRenderFailed = false;
+  preview.lastRenderFailReason = "";
+  preview.lastRenderWasStale = false;
 
   const doDOF = !!document.getElementById("optDOF")?.checked;
   const doCA  = !!document.getElementById("optCA")?.checked;
@@ -4609,6 +4782,24 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
   const taps = [[0,0],[0.55,0.15],[-0.48,0.36],[0.25,-0.58],[-0.28,-0.18]];
 
+  function downsamplePreviewCurve(arrLike, maxN = 140) {
+    const arr = Array.from(arrLike || []);
+    if (!arr.length) return [];
+    if (arr.length <= maxN) return arr.map((v) => Number(v || 0));
+    const out = [];
+    const n = arr.length;
+    for (let i = 0; i < maxN; i++) {
+      const t = maxN === 1 ? 0 : (i / (maxN - 1));
+      const x = t * (n - 1);
+      const i0 = Math.floor(x);
+      const i1 = Math.min(n - 1, i0 + 1);
+      const u = x - i0;
+      const v = (Number(arr[i0] || 0) * (1 - u)) + (Number(arr[i1] || 0) * u);
+      out.push(v);
+    }
+    return out;
+  }
+
   function renderFastLUT() {
     const LUT_N = 900;
     const WAVES = doCA ? ["c", "d", "g"] : [wavePreset, wavePreset, wavePreset];
@@ -4638,6 +4829,16 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     // Build LUT in chunks (prevents freezing)
     let k = 0;
     const kPerFrame = (q === "hq") ? 18 : (q === "draft" ? 40 : 26);
+    const candidateSummary = (choice?.candidates || []).map((c) => ({
+      tag: c?.tag || "",
+      score: Number(c?.score || 0),
+      chiefOk: Number(c?.chiefOk || 0),
+      chiefTotal: Number(c?.chiefTotal || 0),
+      pupilOk: Number(c?.pupilOk || 0),
+      pupilTotal: Number(c?.pupilTotal || 0),
+      sensorX: Number(c?.sensorX || 0),
+      lensShift: Number(c?.lensShift || 0),
+    }));
     const lutDiag = {
       chiefOk: 0,
       chiefFail: 0,
@@ -4645,6 +4846,9 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       pupilOk: 0,
       pupilTotal: 0,
       transFloorFallback: 0,
+      chiefCurve: new Float32Array(LUT_N),
+      transCurve: new Float32Array(LUT_N),
+      heatCurve: new Float32Array(LUT_N),
     };
 
     function buildStep() {
@@ -4655,6 +4859,8 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         const a = k / (LUT_N - 1);
         const rS = a * rMaxSensor;
         const pS = { x: startX, y: rS, z: 0 };
+        let chiefPassK = 0;
+        let transSumK = 0;
 
         naturalLUT[k] = naturalCos4(rS);
 
@@ -4690,6 +4896,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
               lutDiag.chiefFail++;
               rObjLUT[ch][k] = 0;
             }
+            if (chiefOk) chiefPassK++;
           }
 
           // pupil sampling -> transmission + sigma
@@ -4726,6 +4933,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
             transLUT[ch][k] = Math.max(transLUT[ch][k], 0.08);
             lutDiag.transFloorFallback++;
           }
+          transSumK += Number(transLUT[ch][k] || 0);
 
           if (ok > 2) {
             const my = sumY / ok, mz = sumZ / ok;
@@ -4736,6 +4944,12 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
             sigmaLUT[ch][k] = 0;
           }
         }
+
+        const chiefK = chiefPassK / 3;
+        const transK = transSumK / 3;
+        lutDiag.chiefCurve[k] = chiefK;
+        lutDiag.transCurve[k] = transK;
+        lutDiag.heatCurve[k] = Math.max(0, Math.min(1, chiefK * 0.55 + transK * 0.45));
       }
 
       if (k < LUT_N) {
@@ -4756,8 +4970,10 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
           lensShift,
           sensorX,
           zoomPos: Number(ui.zoomPos?.value || 0),
+          candidateSummary,
+          appliedGroupOffsets: clone(lens?.zoomConfig?.appliedGroupOffsets || {}),
         });
-        showWarn("Preview recovery actief: beperkte reverse traces, fallback gebruikt.");
+        showWarn("Preview reverse-map is zwak; rendering kan falen.");
       }
 
       setUsableCircleFromLUT(transLUT[1], naturalLUT, rMaxSensor);
@@ -4871,24 +5087,47 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
       wctx.putImageData(out, 0, 0);
       const litRatio = (W * H) > 0 ? (litPx / (W * H)) : 0;
-      if (litRatio < 0.001) {
-        console.warn("[viewer] preview output almost black", { litPx, W, H, litRatio });
-        if (hasImg && preview.imgCanvas.width > 1 && preview.imgCanvas.height > 1) {
-          wctx.save();
-          wctx.setTransform(1, 0, 0, 1, 0, 0);
-          wctx.clearRect(0, 0, W, H);
-          wctx.imageSmoothingEnabled = true;
-          wctx.imageSmoothingQuality = "high";
-          wctx.drawImage(preview.imgCanvas, 0, 0, preview.imgCanvas.width, preview.imgCanvas.height, 0, 0, W, H);
-          wctx.restore();
-          preview.worldReady = true;
-          showWarn("Preview fallback actief: bronbeeld getoond (reverse map zwak).");
+      const diagPayload = {
+        mode: "lut",
+        failReason: "",
+        previewState: selectedState.tag || "current",
+        focusMode: focusModeUi,
+        lensShift,
+        sensorX,
+        zoomPos: Number(ui.zoomPos?.value || 0),
+        chiefOk: lutDiag.chiefOk,
+        chiefTotal: lutDiag.chiefOk + lutDiag.chiefFail,
+        pupilOk: lutDiag.pupilOk,
+        pupilTotal: lutDiag.pupilTotal,
+        transFloorFallback: lutDiag.transFloorFallback,
+        litRatio,
+        litPx,
+        width: W,
+        height: H,
+        candidateSummary,
+        appliedGroupOffsets: clone(lens?.zoomConfig?.appliedGroupOffsets || {}),
+        chiefCurve: downsamplePreviewCurve(lutDiag.chiefCurve),
+        transCurve: downsamplePreviewCurve(lutDiag.transCurve),
+        heatCurve: downsamplePreviewCurve(lutDiag.heatCurve),
+      };
+
+      if (litRatio < MIN_RENDER_LIT_RATIO) {
+        diagPayload.failReason = "reverse-map weak";
+        console.warn("[viewer] preview output too weak", diagPayload);
+        markPreviewFailure("reverse-map weak", diagPayload);
+        if (preview.lastValidReady) {
+          preview.lastRenderWasStale = true;
+          showWarn(
+            `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%). Stale preview shown.`
+          );
         } else {
-          preview.worldReady = false;
-          showWarn("Preview bijna volledig zwart; probeer autofocus/zoom of andere image.");
+          showWarn(
+            `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%).`
+          );
         }
       } else {
-        preview.worldReady = true;
+        markPreviewSuccess(diagPayload);
+        snapshotPreviewAsLastValid();
       }
       hidePreviewProgress();
       drawPreviewViewport();
@@ -4906,6 +5145,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
     const out  = wctx.createImageData(W, H);
     const outD = out.data;
+    let litPx = 0;
 
     const epsX   = 0.05;
     const startX = sensorX + epsX;
@@ -4972,6 +5212,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
           if (wSum <= 1e-9) {
             outD[idx] = 0; outD[idx + 1] = 0; outD[idx + 2] = 0; outD[idx + 3] = 255;
           } else {
+            litPx++;
             outD[idx]     = linToSrgb(accR / wSum);
             outD[idx + 1] = linToSrgb(accG / wSum);
             outD[idx + 2] = linToSrgb(accB / wSum);
@@ -4981,7 +5222,40 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       }
 
       wctx.putImageData(out, 0, 0);
-      preview.worldReady = true;
+      if (row < H) {
+        preview.worldReady = true;
+        preview.lastRenderFailed = false;
+        preview.lastRenderWasStale = false;
+      } else {
+        const litRatio = (W * H) > 0 ? (litPx / (W * H)) : 0;
+        const diagPayload = {
+          mode: "dof",
+          failReason: "",
+          previewState: selectedState.tag || "current",
+          focusMode: focusModeUi,
+          lensShift,
+          sensorX,
+          zoomPos: Number(ui.zoomPos?.value || 0),
+          litRatio,
+          litPx,
+          width: W,
+          height: H,
+        };
+        if (litRatio < MIN_RENDER_LIT_RATIO) {
+          diagPayload.failReason = "reverse-map weak (dof)";
+          console.warn("[viewer] preview DOF output too weak", diagPayload);
+          markPreviewFailure("reverse-map weak (dof)", diagPayload);
+          if (preview.lastValidReady) {
+            preview.lastRenderWasStale = true;
+            showWarn(`Preview render failed (DOF): reverse map weak. Stale preview shown.`);
+          } else {
+            showWarn(`Preview render failed (DOF): reverse map weak.`);
+          }
+        } else {
+          markPreviewSuccess(diagPayload);
+          snapshotPreviewAsLastValid();
+        }
+      }
       drawPreviewViewport();
 
       if (row < H) requestAnimationFrame(step);
@@ -5439,6 +5713,12 @@ function wireUI() {
 
   // selection hotkeys
   window.addEventListener("keydown", (e) => {
+    if (e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "D" || e.key === "d")) {
+      preview.debugOverlay = !preview.debugOverlay;
+      drawPreviewViewport();
+      showWarn(preview.debugOverlay ? "Preview debug overlay: ON" : "Preview debug overlay: OFF");
+      return;
+    }
     if (VIEWER_MODE) return;
     if (e.key === "Delete" || e.key === "Backspace") {
       if (document.activeElement && ["INPUT","TEXTAREA","SELECT"].includes(document.activeElement.tagName)) return;
