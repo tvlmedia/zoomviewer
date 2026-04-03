@@ -81,29 +81,74 @@
   preview.imgCtx = preview.imgCanvas.getContext("2d");
   preview.worldCtx = preview.worldCanvas.getContext("2d");
 
+  const DEBUG_VIEWER = true;
+  const dbg = (...args) => { if (DEBUG_VIEWER) console.log("[viewer]", ...args); };
+
+  function pickEl(...ids) {
+    for (const id of ids) {
+      if (!id) continue;
+      const el = document.getElementById(id);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  function setText(el, txt) {
+    if (!el) return false;
+    el.textContent = String(txt ?? "");
+    return true;
+  }
+
+  function setHtml(el, txt) {
+    if (!el) return false;
+    el.innerHTML = String(txt ?? "");
+    return true;
+  }
+
+  function toggleClassSafe(el, className, on) {
+    if (!el || !className) return false;
+    if (on) el.classList.add(className);
+    else el.classList.remove(className);
+    return true;
+  }
+
+  function setStatus(msg) {
+    setText(ui.status, msg);
+  }
+
+  function setFooterWarn(msg) {
+    setText(ui.footerWarn, msg || "");
+  }
+
   // -------------------- UI --------------------
   const ui = {
     toolbar: $(".toolbar"),
     tbody: $("#surfTbody"),
-    status: $("#statusText"),
+    status: pickEl("statusText"),
 
-    efl: $("#badgeEfl"),
-    bfl: $("#badgeBfl"),
-    tstop: $("#badgeT"),
-    vig: $("#badgeVig"),
-    fov: $("#badgeFov"),
-    cov: $("#badgeCov"),
-    ic: $("#badgeIC"),
+    efl: pickEl("badgeEfl", "badgeEflTop"),
+    bfl: pickEl("badgeBfl", "badgeBflTop"),
+    tstop: pickEl("badgeT", "badgeTTop"),
+    vig: pickEl("badgeVig"),
+    fov: pickEl("badgeFov", "badgeFovTop"),
+    cov: pickEl("badgeCov", "badgeCovTop"),
+    ic: pickEl("badgeIC", "badgeSoftIC", "badgeSoftICTop", "badgeICTop"),
+    softIC: pickEl("badgeSoftIC", "badgeSoftICTop", "badgeIC", "badgeICTop"),
+    dist: pickEl("badgeDist", "badgeDistTop"),
+    sharp: pickEl("badgeSharp", "badgeSharpTop"),
+    od: pickEl("badgeOD", "badgeODTop"),
+    realism: pickEl("badgeRealism", "badgeRealismTop"),
+    merit: pickEl("badgeMerit", "badgeMeritTop"),
 
-    footerWarn: $("#footerWarn"),
-    metaInfo: $("#metaInfo"),
+    footerWarn: pickEl("footerWarn"),
+    metaInfo: pickEl("metaInfo", "statusText"),
 
-    eflTop: $("#badgeEflTop"),
-    bflTop: $("#badgeBflTop"),
-    tstopTop: $("#badgeTTop"),
-    fovTop: $("#badgeFovTop"),
-    covTop: $("#badgeCovTop"),
-    icTop: $("#badgeICTop"),
+    eflTop: pickEl("badgeEflTop", "badgeEfl"),
+    bflTop: pickEl("badgeBflTop", "badgeBfl"),
+    tstopTop: pickEl("badgeTTop", "badgeT"),
+    fovTop: pickEl("badgeFovTop", "badgeFov"),
+    covTop: pickEl("badgeCovTop", "badgeCov"),
+    icTop: pickEl("badgeICTop", "badgeSoftICTop", "badgeIC"),
 
     sensorPreset: $("#sensorPreset"),
     sensorW: $("#sensorW"),
@@ -197,7 +242,7 @@
     const ctrl = el.closest(".ctrl");
     const toolbarItem = ui.toolbar && ui.toolbar.contains(el) ? el.closest("button, label.fileBtn, .sep") : null;
     const target = ctrl || toolbarItem || el;
-    target.classList.add("viewerHidden");
+    toggleClassSafe(target, "viewerHidden", true);
   }
 
   function applyViewerModeUi() {
@@ -207,7 +252,7 @@
     document.title = "Zoom Lens Viewer — Meridional Raytracer (2D)";
 
     const leftHint = document.querySelector(".panelHeader .hint");
-    if (leftHint) leftHint.textContent = "Laad je builder JSON en preview wide/tele + rays.";
+    setText(leftHint, "Laad je builder JSON en preview wide/tele + rays.");
 
     VIEWER_HIDE_IDS.forEach((id) => hideViewerNode(document.getElementById(id)));
   }
@@ -247,14 +292,14 @@ if (!SENSOR_PRESETS[ui.sensorPreset.value]) ui.sensorPreset.value = "ARRI Alexa 
   function updateUsableCircleBadges() {
     const uc = preview.usableCircle;
     if (!uc?.valid) {
-      if (ui.ic) ui.ic.textContent = "Image Circle: —";
-      if (ui.icTop) ui.icTop.textContent = "IC: —";
+      setText(ui.ic, "Image Circle: —");
+      setText(ui.icTop, "IC: —");
       return;
     }
     const leftTxt = `Image Circle: Ø${uc.diameterMm.toFixed(1)}mm`;
     const topTxt = `IC: Ø${uc.diameterMm.toFixed(1)}mm`;
-    if (ui.ic) ui.ic.textContent = leftTxt;
-    if (ui.icTop) ui.icTop.textContent = topTxt;
+    setText(ui.ic, leftTxt);
+    setText(ui.icTop, topTxt);
   }
 
   // -------------------- default preview chart (GitHub) --------------------
@@ -807,6 +852,9 @@ function warnMissingGlass(name) {
   }
 
   let lens = sanitizeLens(omit50ConceptV1());
+  let _lastRenderStats = null;
+  let _recoveryInProgress = false;
+  let _recoveryCooldown = 0;
 
   function getGroupZoomOffset(group, zoomPos) {
     if (!group || group.enabled === false || group.moveWithZoom === false) return 0;
@@ -857,22 +905,206 @@ function warnMissingGlass(name) {
     const pos = clamp(num(ui.zoomPos.value, 0), 0, 100);
     ui.zoomPos.value = pos.toFixed(0);
     const target = range.wide + ((range.tele - range.wide) * (pos / 100));
-    if (ui.zoomPosOut) ui.zoomPosOut.textContent = `${pos.toFixed(0)}%`;
-    if (ui.zoomTargetOut) ui.zoomTargetOut.textContent = `${target.toFixed(1)}mm`;
+    setText(ui.zoomPosOut, `${pos.toFixed(0)}%`);
+    setText(ui.zoomTargetOut, `${target.toFixed(1)}mm`);
     if (ui.zoomRatioOut) {
       const ratio = range.tele / Math.max(1e-6, range.wide);
-      ui.zoomRatioOut.textContent = `Zoom ratio: ${ratio.toFixed(2)}x`;
+      setText(ui.zoomRatioOut, `Zoom ratio: ${ratio.toFixed(2)}x`);
     }
     return { ...range, pos, target };
   }
 
+  function sanitizeRuntimeViewerState() {
+    ensureLensZoomModel(lens);
+    const zc = lens.zoomConfig || {};
+    zc.pos = clamp(num(zc.pos, 0), 0, 1);
+    zc.wideFL = clamp(Math.abs(num(zc.wideFL, ZOOM_VIEWER_CFG.defaultWide)), ZOOM_VIEWER_CFG.minFl, ZOOM_VIEWER_CFG.maxFl);
+    zc.teleFL = clamp(Math.abs(num(zc.teleFL, Math.max(zc.wideFL, ZOOM_VIEWER_CFG.defaultTele))), ZOOM_VIEWER_CFG.minFl, ZOOM_VIEWER_CFG.maxFl);
+    if (zc.teleFL < zc.wideFL) [zc.wideFL, zc.teleFL] = [zc.teleFL, zc.wideFL];
+    zc.movementScale = clamp(num(zc.movementScale, 1), 0, 6);
+    zc.enabled = boolLike(zc.enabled, true);
+    zc.autoFocusAfterZoom = boolLike(zc.autoFocusAfterZoom, true);
+    const cleaned = {};
+    let droppedOffsets = 0;
+    for (const [k, v] of Object.entries(zc.appliedGroupOffsets || {})) {
+      const gid = normalizeGroupId(k, "");
+      if (!gid || !lens.groups?.[gid]) continue;
+      const n = Number(v);
+      if (!Number.isFinite(n) || Math.abs(n) > 250) {
+        droppedOffsets++;
+        continue;
+      }
+      cleaned[gid] = n;
+    }
+    zc.appliedGroupOffsets = cleaned;
+    if (droppedOffsets > 0) {
+      console.warn("[viewer] dropped invalid zoom offsets:", droppedOffsets);
+      setFooterWarn(`Zoom offsets opgeschoond (${droppedOffsets}).`);
+    }
+  }
+
+  function getTraceStatsForCurrentState(label = "current") {
+    const fieldAngle = Number(ui.fieldAngle?.value || 0);
+    const rayCount = Math.max(3, Number(ui.rayCount?.value || 31));
+    const wavePreset = ui.wavePreset?.value || "d";
+    const focusMode = String(ui.focusMode?.value || "cam").toLowerCase();
+    const sensorX = (focusMode === "cam") ? Number(ui.sensorOffset?.value || 0) : 0.0;
+    const lensShift = (focusMode === "lens") ? Number(ui.lensFocus?.value || 0) : 0.0;
+    dbg("computeVertices", { label, focusMode, sensorX, lensShift });
+    computeVertices(lens.surfaces, lensShift, sensorX);
+    dbg("buildRays", { label, fieldAngle, rayCount });
+    const rays = buildRays(lens.surfaces, fieldAngle, rayCount);
+    let valid = 0;
+    let vignetted = 0;
+    let tir = 0;
+    let invalid = 0;
+    const traces = [];
+    for (const ray of rays) {
+      const tr = traceRayForward(clone(ray), lens.surfaces, wavePreset);
+      traces.push(tr);
+      if (!tr) {
+        invalid++;
+        continue;
+      }
+      if (tr.vignetted) vignetted++;
+      if (tr.tir) tir++;
+      if (!tr.vignetted && !tr.tir && tr.endRay) valid++;
+    }
+    dbg("traceRayForward count", { label, total: rays.length, valid, vignetted, tir, invalid });
+    return { label, rays, traces, valid, vignetted, tir, invalid, total: rays.length, focusMode, sensorX, lensShift, fieldAngle, rayCount, wavePreset };
+  }
+
+  function captureViewerStateSnapshot() {
+    return {
+      lens: clone(lens),
+      focusMode: String(ui.focusMode?.value || "cam"),
+      sensorOffset: String(ui.sensorOffset?.value || "0"),
+      lensFocus: String(ui.lensFocus?.value || "0"),
+      zoomPos: String(ui.zoomPos?.value || "0"),
+      zoomWide: String(ui.zoomWideFL?.value || ""),
+      zoomTele: String(ui.zoomTeleFL?.value || ""),
+      zoomAutoFocus: !!ui.zoomAutoFocus?.checked,
+    };
+  }
+
+  function restoreViewerStateSnapshot(state) {
+    if (!state) return false;
+    lens = sanitizeLens(clone(state.lens || lens));
+    if (ui.focusMode) ui.focusMode.value = String(state.focusMode || "cam");
+    if (ui.sensorOffset) ui.sensorOffset.value = String(state.sensorOffset ?? "0");
+    if (ui.lensFocus) ui.lensFocus.value = String(state.lensFocus ?? "0");
+    if (ui.zoomWideFL && state.zoomWide !== "") ui.zoomWideFL.value = String(state.zoomWide);
+    if (ui.zoomTeleFL && state.zoomTele !== "") ui.zoomTeleFL.value = String(state.zoomTele);
+    if (ui.zoomPos) ui.zoomPos.value = String(state.zoomPos ?? "0");
+    if (ui.zoomAutoFocus) ui.zoomAutoFocus.checked = !!state.zoomAutoFocus;
+    sanitizeRuntimeViewerState();
+    buildTable();
+    applySensorToIMS();
+    updateZoomReadouts();
+    applyZoomState(num(ui.zoomPos?.value, 0) / 100, { render: false, syncUi: true, autoFocus: false });
+    return true;
+  }
+
+  function runAutoFocusRecovery(mode = "lens") {
+    dbg("autofocus recovery:start", { mode });
+    try {
+      const r = autoFocus({ silent: true, render: false, mode });
+      const ok = !!r?.ok;
+      dbg("autofocus recovery:end", { mode, ok });
+      return ok;
+    } catch (e) {
+      console.warn("[viewer] autofocus recovery failed", e);
+      dbg("autofocus recovery:end", { mode, ok: false, error: String(e?.message || e) });
+      return false;
+    }
+  }
+
+  function runViewerRecovery(reason = "unknown", baseline = null) {
+    if (_recoveryInProgress) return false;
+    _recoveryInProgress = true;
+    try {
+      console.warn("[viewer] recovery triggered:", reason);
+      const base = baseline || getTraceStatsForCurrentState("baseline");
+      const original = captureViewerStateSnapshot();
+      let best = { state: original, stats: base, label: "baseline" };
+      const candidates = [];
+
+      const runCandidate = (label, fn) => {
+        try {
+          if (typeof fn === "function") fn();
+          sanitizeRuntimeViewerState();
+          const stats = getTraceStatsForCurrentState(label);
+          candidates.push({ label, stats, state: captureViewerStateSnapshot() });
+          const better =
+            stats.valid > best.stats.valid ||
+            (stats.valid === best.stats.valid && stats.vignetted < best.stats.vignetted) ||
+            (stats.valid === best.stats.valid && stats.vignetted === best.stats.vignetted && stats.tir < best.stats.tir);
+          if (better) best = { state: captureViewerStateSnapshot(), stats, label };
+        } catch (e) {
+          console.warn("[viewer] recovery candidate failed", label, e);
+        }
+      };
+
+      runCandidate("current", null);
+      runCandidate("autofocus-lens", () => { runAutoFocusRecovery("lens"); });
+      runCandidate("cam-zero", () => {
+        if (ui.focusMode) ui.focusMode.value = "cam";
+        if (ui.sensorOffset) ui.sensorOffset.value = "0";
+        if (ui.lensFocus) ui.lensFocus.value = "0";
+      });
+      runCandidate("autofocus-cam", () => { runAutoFocusRecovery("cam"); });
+      runCandidate("lens-zero", () => {
+        if (ui.focusMode) ui.focusMode.value = "lens";
+        if (ui.lensFocus) ui.lensFocus.value = "0";
+        if (ui.sensorOffset) ui.sensorOffset.value = "0";
+      });
+
+      const zNow = clamp(num(ui.zoomPos?.value, 0), 0, 100) / 100;
+      const zSamples = Array.from(new Set([zNow, 0, 0.35, 0.5, 0.75, 1]));
+      for (const zp of zSamples) {
+        runCandidate(`zoom-${Math.round(zp * 100)}`, () => {
+          applyZoomState(zp, { render: false, syncUi: true, autoFocus: false });
+        });
+      }
+
+      runCandidate("zoom-disabled", () => {
+        ensureLensZoomModel(lens);
+        lens.zoomConfig.enabled = false;
+      });
+      runCandidate("zoom-reenabled", () => {
+        ensureLensZoomModel(lens);
+        lens.zoomConfig.enabled = true;
+        applyZoomState(num(ui.zoomPos?.value, 0) / 100, { render: false, syncUi: true, autoFocus: false });
+      });
+
+      restoreViewerStateSnapshot(best.state);
+      setFooterWarn(
+        best.stats.valid > 0
+          ? `Recovery actief (${reason}) → ${best.label}: ${best.stats.valid}/${best.stats.total} geldige rays`
+          : `Recovery geprobeerd (${reason}) maar nog geen geldige rays`
+      );
+      dbg("recovery result", {
+        reason,
+        chosen: best.label,
+        valid: best.stats.valid,
+        total: best.stats.total,
+        candidates: candidates.map((c) => `${c.label}:${c.stats.valid}/${c.stats.total}`).join(", "),
+      });
+      return best.stats.valid > 0;
+    } finally {
+      _recoveryInProgress = false;
+    }
+  }
+
   function applyZoomState(pos01, opts = null) {
     const o = opts || {};
-    ensureLensZoomModel(lens);
+    sanitizeRuntimeViewerState();
     const p = clamp(num(pos01, lens?.zoomConfig?.pos ?? 0), 0, 1);
+    dbg("applyZoomState", { pos: p, render: o.render !== false, autoFocus: !!o.autoFocus });
 
     lens.zoomConfig.pos = p;
     lens.zoomConfig.appliedGroupOffsets = buildZoomGroupOffsets(lens, p);
+    sanitizeRuntimeViewerState();
     if (ui.zoomPos && o.syncUi !== false) ui.zoomPos.value = String(Math.round(p * 100));
     if (o.render !== false) {
       scheduleRenderAll();
@@ -905,19 +1137,55 @@ function warnMissingGlass(name) {
   }
 
   function loadLens(obj) {
-    lens = sanitizeLens(obj);
-    selectedIndex = 0;
-    clampAllApertures(lens.surfaces);
-    if (ui.zoomWideFL) ui.zoomWideFL.value = Number(lens?.zoomConfig?.wideFL ?? ZOOM_VIEWER_CFG.defaultWide).toFixed(2);
-    if (ui.zoomTeleFL) ui.zoomTeleFL.value = Number(lens?.zoomConfig?.teleFL ?? ZOOM_VIEWER_CFG.defaultTele).toFixed(2);
-    if (ui.zoomPos) ui.zoomPos.value = String(Math.round(clamp(num(lens?.zoomConfig?.pos, 0), 0, 1) * 100));
-    if (ui.zoomAutoFocus) ui.zoomAutoFocus.checked = lens?.zoomConfig?.autoFocusAfterZoom !== false;
-    buildTable();
-    applySensorToIMS();
-    updateZoomReadouts();
-    applyZoomState(num(lens?.zoomConfig?.pos, 0), { render: false, syncUi: true, autoFocus: false });
-    renderAll();
-    if (preview.ready) scheduleRenderPreview();
+    dbg("loadLens:start");
+    const fallback = captureViewerStateSnapshot();
+    try {
+      lens = sanitizeLens(obj);
+      selectedIndex = 0;
+      clampAllApertures(lens.surfaces);
+      sanitizeRuntimeViewerState();
+      if (ui.zoomWideFL) ui.zoomWideFL.value = Number(lens?.zoomConfig?.wideFL ?? ZOOM_VIEWER_CFG.defaultWide).toFixed(2);
+      if (ui.zoomTeleFL) ui.zoomTeleFL.value = Number(lens?.zoomConfig?.teleFL ?? ZOOM_VIEWER_CFG.defaultTele).toFixed(2);
+      if (ui.zoomPos) ui.zoomPos.value = String(Math.round(clamp(num(lens?.zoomConfig?.pos, 0), 0, 1) * 100));
+      if (ui.zoomAutoFocus) ui.zoomAutoFocus.checked = lens?.zoomConfig?.autoFocusAfterZoom !== false;
+      buildTable();
+      applySensorToIMS();
+      updateZoomReadouts();
+      applyZoomState(num(lens?.zoomConfig?.pos, 0), { render: false, syncUi: true, autoFocus: false });
+      const stats = renderAll({ source: "loadLens", allowRecovery: false });
+      if (!stats || stats.valid <= 0) {
+        runViewerRecovery("loadLens_no_valid_rays", stats || null);
+        renderAll({ source: "loadLens_recovery", allowRecovery: false });
+      }
+      if (preview.ready) scheduleRenderPreview();
+
+      const stopIdx = lens.surfaces.findIndex((s) => !!s.stop);
+      const physicalCount = lens.surfaces.filter((s) => {
+        const t = String(s?.type || "").toUpperCase();
+        return t !== "OBJ" && t !== "IMS";
+      }).length;
+      const s = _lastRenderStats || stats || getTraceStatsForCurrentState("loadLens-end") || {
+        total: 0, vignetted: 0, tir: 0, valid: 0,
+      };
+      console.groupCollapsed("[viewer] JSON load");
+      console.log("surfaces:", lens.surfaces.length);
+      console.log("physicalSurfaces:", physicalCount);
+      console.log("stopIndex:", stopIdx);
+      console.log("focusMode:", String(ui.focusMode?.value || "cam"));
+      console.log("lensFocus:", Number(ui.lensFocus?.value || 0));
+      console.log("sensorOffset:", Number(ui.sensorOffset?.value || 0));
+      console.log("zoomPos:", Number(ui.zoomPos?.value || 0));
+      console.log("rayCount:", Number(ui.rayCount?.value || 31));
+      console.log("traced/vignetted/tir/valid:", `${s.total}/${s.vignetted}/${s.tir}/${s.valid}`);
+      console.groupEnd();
+      dbg("loadLens:end");
+    } catch (e) {
+      console.error("[viewer] loadLens failed", e);
+      restoreViewerStateSnapshot(fallback);
+      setStatus(`Load error: ${e?.message || e}`);
+      setFooterWarn("JSON geladen maar recovery nodig; vorige staat hersteld.");
+      renderAll({ source: "loadLens_error", allowRecovery: false });
+    }
   }
 
   // -------------------- table helpers --------------------
@@ -1722,16 +1990,18 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     return { rms, n: ys.length };
   }
 
-  function autoFocus() {
-    if (ui.focusMode) ui.focusMode.value = "lens";
+  function autoFocus(opts = null) {
+    const o = opts || {};
+    const mode = String(o.mode || "lens").toLowerCase() === "cam" ? "cam" : "lens";
+    if (ui.focusMode) ui.focusMode.value = mode;
     if (ui.sensorOffset) ui.sensorOffset.value = "0";
 
     const fieldAngle = Number(ui.fieldAngle?.value || 0);
     const rayCount = Number(ui.rayCount?.value || 31);
     const wavePreset = ui.wavePreset?.value || "d";
 
-    const currentLensShift = Number(ui.lensFocus?.value || 0);
-    const sensorX = 0.0;
+    const currentLensShift = mode === "lens" ? Number(ui.lensFocus?.value || 0) : 0;
+    const sensorX = mode === "cam" ? Number(ui.sensorOffset?.value || 0) : 0.0;
 
     const range = 20;
     const coarseStep = 0.25;
@@ -1760,19 +2030,27 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     if (Number.isFinite(best.rms)) scan(best.shift, 2.0, fineStep);
 
     if (!Number.isFinite(best.rms) || best.n < 5) {
-      if (ui.footerWarn) ui.footerWarn.textContent =
-        "Auto focus (lens) failed (too few valid rays). Try more rays / larger apertures.";
+      if (!o.silent) {
+        setFooterWarn(`Auto focus (${mode}) failed (too few valid rays).`);
+      }
       computeVertices(lens.surfaces, currentLensShift, sensorX);
-      renderAll();
-      return;
+      if (o.render !== false) renderAll({ source: "autofocus_fail", allowRecovery: false });
+      return { ok: false, reason: "too_few_rays", mode, n: best.n };
     }
 
-    if (ui.lensFocus) ui.lensFocus.value = best.shift.toFixed(2);
-    if (ui.footerWarn) ui.footerWarn.textContent =
-      `Auto focus (LENS): lensFocus=${best.shift.toFixed(2)}mm • RMS=${best.rms.toFixed(3)}mm • rays=${best.n}`;
+    if (mode === "lens" && ui.lensFocus) ui.lensFocus.value = best.shift.toFixed(2);
+    if (mode === "cam" && ui.sensorOffset) ui.sensorOffset.value = best.shift.toFixed(2);
+    if (!o.silent) {
+      setFooterWarn(
+        `Auto focus (${mode.toUpperCase()}): shift=${best.shift.toFixed(2)}mm • RMS=${best.rms.toFixed(3)}mm • rays=${best.n}`
+      );
+    }
 
-    renderAll();
-    scheduleRenderPreview();
+    if (o.render !== false) {
+      renderAll({ source: "autofocus_ok", allowRecovery: false });
+      scheduleRenderPreview();
+    }
+    return { ok: true, mode, shift: best.shift, rms: best.rms, n: best.n };
   }
 
   // -------------------- drawing --------------------
@@ -1923,9 +2201,8 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       drawElementBody(world, sA, sB, apRegion);
     }
 
-    if (Number.isFinite(minNonOverlap) && minNonOverlap < 0.5 && ui.footerWarn) {
-      ui.footerWarn.textContent =
-        "WARNING: element surfaces overlap / too thin somewhere — increase t or reduce curvature/aperture.";
+    if (Number.isFinite(minNonOverlap) && minNonOverlap < 0.5) {
+      setFooterWarn("WARNING: element surfaces overlap / too thin somewhere — increase t or reduce curvature/aperture.");
     }
   }
 
@@ -1977,14 +2254,16 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 
   function drawRays(world, rayTraces, sensorX) {
     if (!ctx) return;
+    const traces = Array.isArray(rayTraces) ? rayTraces : [];
+    dbg("drawRays start", { total: traces.length });
     ctx.save();
     ctx.lineWidth = 1.6;
     ctx.strokeStyle = "rgba(70,140,255,0.85)";
     ctx.shadowColor = "rgba(70,140,255,0.45)";
     ctx.shadowBlur = 12;
-
-    for (const tr of rayTraces) {
-      if (!tr.pts || tr.pts.length < 2) continue;
+    let drawn = 0;
+    for (const tr of traces) {
+      if (!tr || !Array.isArray(tr.pts) || tr.pts.length < 2) continue;
       ctx.globalAlpha = tr.vignetted ? 0.10 : 1.0;
 
       ctx.beginPath();
@@ -2005,8 +2284,10 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         }
       }
       ctx.stroke();
+      drawn++;
     }
     ctx.restore();
+    dbg("drawRays end", { total: traces.length, drawn });
   }
 
   function drawStop(world, surfaces) {
@@ -2363,120 +2644,212 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   // ===========================
   // RENDER ALL (rays pane)
   // ===========================
-  function renderAll() {
-    if (!canvas || !ctx) return;
-    if (ui.footerWarn) ui.footerWarn.textContent = "";
+  function renderAll(opts = null) {
+    const o = opts || {};
+    const source = String(o.source || "manual");
+    const allowRecovery = o.allowRecovery !== false;
+    dbg("renderAll:start", { source, allowRecovery });
 
-    const fieldAngle = Number(ui.fieldAngle?.value || 0);
-    const rayCount   = Number(ui.rayCount?.value || 31);
-    const wavePreset = ui.wavePreset?.value || "d";
-
-    const { w: sensorW, h: sensorH, halfH } = getSensorWH();
-
-    const focusMode = String(ui.focusMode?.value || "cam").toLowerCase();
-    const sensorX = (focusMode === "cam") ? Number(ui.sensorOffset?.value || 0) : 0.0;
-    const lensShift = (focusMode === "lens") ? Number(ui.lensFocus?.value || 0) : 0;
-
-    computeVertices(lens.surfaces, lensShift, sensorX);
-
-    const plX = -PL_FFD;
-
-    const rays = buildRays(lens.surfaces, fieldAngle, rayCount);
-    const traces = rays.map((r) => traceRayForward(clone(r), lens.surfaces, wavePreset));
-
-    const vCount = traces.filter((t) => t.vignetted).length;
-    const tirCount = traces.filter((t) => t.tir).length;
-    const vigPct = traces.length ? Math.round((vCount / traces.length) * 100) : 0;
-
-    const { efl, bfl } = estimateEflBflParaxial(lens.surfaces, wavePreset);
-    const T = estimateTStopApprox(efl, lens.surfaces);
-
-    const fov = computeFovDeg(efl, sensorW, sensorH);
-    const fovTxt = !fov
-      ? "FOV: —"
-      : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
-
-    const maxField = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, halfH);
-    const covMode = "v";
-    const { ok: coversGeom, req } = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: 0.5 });
-    const sensorDiagMm = Math.hypot(sensorW, sensorH);
-    const coversByIC = !!(preview.usableCircle?.valid && preview.usableCircle.diameterMm >= sensorDiagMm);
-    const covers = coversGeom && coversByIC;
-
-    const covTxt = !fov
-      ? "COV(V): —"
-      : `COV(V): ±${maxField.toFixed(1)}° • REQ(V): ${(req ?? 0).toFixed(1)}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
-
-    const rearVx = lastPhysicalVertexX(lens.surfaces);
-    const intrusion = rearVx - plX;
-    const rearTxt = (intrusion > 0)
-      ? `REAR INTRUSION: +${intrusion.toFixed(2)}mm ❌`
-      : `REAR CLEAR: ${Math.abs(intrusion).toFixed(2)}mm ✅`;
-
-    const frontVx = firstPhysicalVertexX(lens.surfaces);
-    const lenToFlange = plX - frontVx;
-    const totalLen = lenToFlange + PL_LENS_LIP;
-    const lenTxt = (Number.isFinite(totalLen) && totalLen > 0)
-      ? `LEN≈ ${totalLen.toFixed(1)}mm (front→PL + mount)`
-      : `LEN≈ —`;
-
-    if (ui.efl) ui.efl.textContent = `Focal Length: ${efl == null ? "—" : efl.toFixed(2)}mm`;
-    if (ui.bfl) ui.bfl.textContent = `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
-    if (ui.tstop) ui.tstop.textContent = `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
-    if (ui.vig) ui.vig.textContent = `Vignette: ${vigPct}%`;
-    if (ui.fov) ui.fov.textContent = fovTxt;
-    if (ui.cov) ui.cov.textContent = covers ? "COV: YES" : "COV: NO";
-
-    if (ui.eflTop) ui.eflTop.textContent = ui.efl?.textContent || `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
-    if (ui.bflTop) ui.bflTop.textContent = ui.bfl?.textContent || `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
-    if (ui.tstopTop) ui.tstopTop.textContent = ui.tstop?.textContent || `T≈ ${T == null ? "—" : "T" + T.toFixed(2)}`;
-    if (ui.fovTop) ui.fovTop.textContent = fovTxt;
-    if (ui.covTop) ui.covTop.textContent = ui.cov?.textContent || (covers ? "COV: YES" : "COV: NO");
-
-    if (tirCount > 0 && ui.footerWarn) ui.footerWarn.textContent = `TIR on ${tirCount} rays (check glass / curvature).`;
-
-    if (ui.status) {
-      ui.status.textContent =
-        `Selected: ${selectedIndex} • Traced ${traces.length} rays • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt}`;
+    if (!canvas || !ctx) {
+      console.error("[viewer] renderAll aborted: missing #canvas or 2D context");
+      setStatus("Viewer error: rays canvas ontbreekt.");
+      setFooterWarn("Rays canvas/context niet beschikbaar.");
+      return null;
     }
-    if (ui.metaInfo) ui.metaInfo.textContent = `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm`;
 
-    resizeCanvasToCSS();
-    const r = canvas.getBoundingClientRect();
-    drawBackgroundCSS(r.width, r.height);
+    try {
+      setFooterWarn("");
+      sanitizeRuntimeViewerState();
 
-    const world = makeWorldTransform();
-    drawAxes(world);
+      const fieldAngle = Number(ui.fieldAngle?.value || 0);
+      const rayCount = Math.max(3, Number(ui.rayCount?.value || 31));
+      if (ui.rayCount) ui.rayCount.value = String(rayCount);
+      const wavePreset = ui.wavePreset?.value || "d";
 
-    drawRuler(world, 0, -200);
-    const xMinPL = Math.min(frontVx - 20, plX - 20);
-    drawRulerFrom(world, plX, xMinPL, null, "", +12);
+      const { w: sensorW, h: sensorH, halfH } = getSensorWH();
 
-    drawPLFlange(world, plX);
-    drawLens(world, lens.surfaces);
-    drawStop(world, lens.surfaces);
-    drawRays(world, traces, sensorX);
-    drawPLMountCutout(world, plX);
-    drawSensor(world, sensorX, halfH);
+      const focusMode = String(ui.focusMode?.value || "cam").toLowerCase();
+      const sensorX = (focusMode === "cam") ? Number(ui.sensorOffset?.value || 0) : 0.0;
+      const lensShift = (focusMode === "lens") ? Number(ui.lensFocus?.value || 0) : 0;
+      const plX = -PL_FFD;
 
-    const eflTxt = efl == null ? "—" : `${efl.toFixed(2)}mm`;
-    const tTxt   = T == null ? "—" : `T${T.toFixed(2)}`;
-    const focusTxt = (focusMode === "cam")
-      ? `CamFocus ${sensorX.toFixed(2)}mm`
-      : `LensFocus ${lensShift.toFixed(2)}mm`;
+      let stats = getTraceStatsForCurrentState(source);
+      if (!stats || !Array.isArray(stats.traces)) {
+        stats = { rays: [], traces: [], valid: 0, vignetted: 0, tir: 0, invalid: 0, total: 0 };
+      }
 
-    const titleParts = [
-      lens?.name || "Lens",
-      `EFL ${eflTxt}`,
-      `BFL ${bfl == null ? "—" : bfl.toFixed(2) + "mm"}`,
-      tTxt,
-      fovTxt,
-      covTxt,
-      rearTxt,
-      lenTxt,
-      focusTxt,
-    ];
-    drawTitleOverlay(titleParts);
+      const shouldRecover =
+        allowRecovery &&
+        !_recoveryInProgress &&
+        stats.total > 0 &&
+        stats.valid <= 0 &&
+        Date.now() >= _recoveryCooldown;
+      if (shouldRecover) {
+        _recoveryCooldown = Date.now() + 400;
+        const recovered = runViewerRecovery(`render_no_valid_rays:${source}`, stats);
+        if (recovered) stats = getTraceStatsForCurrentState(`${source}:post-recovery`);
+      }
+
+      const traces = Array.isArray(stats.traces) ? stats.traces : [];
+      const tracedCount = Number(stats.total || traces.length || 0);
+      const validCount = Number(stats.valid || 0);
+      const vCount = Number(stats.vignetted || 0);
+      const tirCount = Number(stats.tir || 0);
+      const invalidCount = Number(stats.invalid || 0);
+      const vigPct = tracedCount ? Math.round((vCount / tracedCount) * 100) : 0;
+
+      dbg("metrics update start", {
+        source,
+        tracedCount,
+        validCount,
+        vignetted: vCount,
+        tirCount,
+        invalidCount,
+      });
+
+      const { efl, bfl } = estimateEflBflParaxial(lens.surfaces, wavePreset);
+      const T = estimateTStopApprox(efl, lens.surfaces);
+
+      const fov = computeFovDeg(efl, sensorW, sensorH);
+      const fovTxt = !fov
+        ? "FOV: —"
+        : `FOV: H ${fov.hfov.toFixed(1)}° • V ${fov.vfov.toFixed(1)}° • D ${fov.dfov.toFixed(1)}°`;
+
+      const maxFieldRaw = coverageTestMaxFieldDeg(lens.surfaces, wavePreset, sensorX, halfH);
+      const maxField = Number.isFinite(maxFieldRaw) ? maxFieldRaw : 0;
+      const covMode = "v";
+      const { ok: coversGeom, req } = coversSensorYesNo({ fov, maxField, mode: covMode, marginDeg: 0.5 });
+      const sensorDiagMm = Math.hypot(sensorW, sensorH);
+      const coversByIC = !!(preview.usableCircle?.valid && preview.usableCircle.diameterMm >= sensorDiagMm);
+      const covers = !!fov && coversGeom && coversByIC;
+
+      const covTxt = !fov
+        ? "COV(V): —"
+        : `COV(V): ±${maxField.toFixed(1)}° • REQ(V): ${(req ?? 0).toFixed(1)}° • ${covers ? "COVERS ✅" : "NO ❌"}`;
+
+      const rearVx = lastPhysicalVertexX(lens.surfaces);
+      const intrusion = Number.isFinite(rearVx) ? rearVx - plX : NaN;
+      const rearTxt = !Number.isFinite(intrusion)
+        ? "REAR CLEAR: —"
+        : (intrusion > 0 ? `REAR INTRUSION: +${intrusion.toFixed(2)}mm ❌` : `REAR CLEAR: ${Math.abs(intrusion).toFixed(2)}mm ✅`);
+
+      const frontVx = firstPhysicalVertexX(lens.surfaces);
+      const lenToFlange = Number.isFinite(frontVx) ? (plX - frontVx) : NaN;
+      const totalLen = Number.isFinite(lenToFlange) ? (lenToFlange + PL_LENS_LIP) : NaN;
+      const lenTxt = (Number.isFinite(totalLen) && totalLen > 0)
+        ? `LEN≈ ${totalLen.toFixed(1)}mm (front→PL + mount)`
+        : "LEN≈ —";
+
+      const eflLeft = `Focal Length: ${efl == null ? "—" : efl.toFixed(2)}mm`;
+      const bflLeft = `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
+      const tLeft = `T≈ ${T == null ? "—" : `T${T.toFixed(2)}`}`;
+      const vigLeft = `Vignette: ${vigPct}%`;
+      const covShort = fov ? (covers ? "COV: YES" : "COV: NO") : "COV: —";
+      const eflTop = `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
+      const bflTop = `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
+      const tTop = `T≈ ${T == null ? "—" : `T${T.toFixed(2)}`}`;
+
+      setText(ui.efl, eflLeft);
+      setText(ui.bfl, bflLeft);
+      setText(ui.tstop, tLeft);
+      setText(ui.vig, vigLeft);
+      setText(ui.fov, fovTxt);
+      setText(ui.cov, covShort);
+
+      setText(ui.eflTop, eflTop);
+      setText(ui.bflTop, bflTop);
+      setText(ui.tstopTop, tTop);
+      setText(ui.fovTop, fovTxt);
+      setText(ui.covTop, covShort);
+
+      if (tirCount > 0) {
+        setFooterWarn(`TIR on ${tirCount} rays (check glass / curvature).`);
+      } else if (tracedCount > 0 && validCount <= 0) {
+        setFooterWarn("Geen geldige rays in huidige staat. Recovery geprobeerd.");
+      } else if (invalidCount > 0 && validCount > 0) {
+        setFooterWarn(`${invalidCount} rays waren invalid/null maar render gaat door.`);
+      }
+
+      setStatus(
+        `Selected: ${selectedIndex} • Traced ${tracedCount} rays • valid ${validCount} • field ${fieldAngle.toFixed(2)}° • vignetted ${vCount} • ${covTxt}`
+      );
+      setText(ui.metaInfo, `sensor ${sensorW.toFixed(2)}×${sensorH.toFixed(2)}mm`);
+
+      dbg("metrics update end", {
+        source,
+        efl,
+        bfl,
+        tstop: T,
+        fov: fov ? `${fov.hfov.toFixed(2)}/${fov.vfov.toFixed(2)}/${fov.dfov.toFixed(2)}` : null,
+      });
+
+      resizeCanvasToCSS();
+      const r = canvas.getBoundingClientRect();
+      drawBackgroundCSS(r.width, r.height);
+
+      const world = makeWorldTransform();
+      drawAxes(world);
+
+      drawRuler(world, 0, -200);
+      const xMinPL = Number.isFinite(frontVx) ? Math.min(frontVx - 20, plX - 20) : (plX - 20);
+      drawRulerFrom(world, plX, xMinPL, null, "", +12);
+
+      drawPLFlange(world, plX);
+      drawLens(world, lens.surfaces);
+      drawStop(world, lens.surfaces);
+      drawRays(world, traces, sensorX);
+      drawPLMountCutout(world, plX);
+      drawSensor(world, sensorX, halfH);
+
+      const eflTxt = efl == null ? "—" : `${efl.toFixed(2)}mm`;
+      const tTxt = T == null ? "—" : `T${T.toFixed(2)}`;
+      const focusTxt = (focusMode === "cam")
+        ? `CamFocus ${sensorX.toFixed(2)}mm`
+        : `LensFocus ${lensShift.toFixed(2)}mm`;
+
+      const titleParts = [
+        lens?.name || "Lens",
+        `EFL ${eflTxt}`,
+        `BFL ${bfl == null ? "—" : `${bfl.toFixed(2)}mm`}`,
+        tTxt,
+        fovTxt,
+        covTxt,
+        rearTxt,
+        lenTxt,
+        focusTxt,
+      ];
+      drawTitleOverlay(titleParts);
+
+      _lastRenderStats = {
+        ...stats,
+        source,
+        efl,
+        bfl,
+        T,
+        fov,
+        covTxt,
+        covers,
+        focusMode,
+        sensorX,
+        lensShift,
+      };
+      dbg("renderAll:end", { source, valid: validCount, total: tracedCount });
+      return _lastRenderStats;
+    } catch (e) {
+      console.error("[viewer] renderAll failed", e);
+      setStatus(`Render error: ${e?.message || e}`);
+      setFooterWarn("Render error; recovery gestart.");
+      if (allowRecovery && !_recoveryInProgress && Date.now() >= _recoveryCooldown) {
+        _recoveryCooldown = Date.now() + 750;
+        try {
+          const recovered = runViewerRecovery(`render_exception:${source}`, null);
+          if (recovered) return renderAll({ source: `${source}:post-exception-recovery`, allowRecovery: false });
+        } catch (e2) {
+          console.error("[viewer] exception recovery failed", e2);
+        }
+      }
+      return null;
+    }
   }
 
   // -------------------- view controls (RAYS canvas) --------------------
@@ -3213,7 +3586,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     }
 
     if (v.mode !== "auto") {
-      if (ui.footerWarn) ui.footerWarn.textContent = "Custom mode not implemented yet (auto only).";
+      setFooterWarn("Custom mode not implemented yet (auto only).");
       return;
     }
 
@@ -3228,7 +3601,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     }
 
     if (!chunk || !Array.isArray(chunk) || chunk.length < 2) {
-      if (ui.footerWarn) ui.footerWarn.textContent = "Element insert failed (check modal values).";
+      setFooterWarn("Element insert failed (check modal values).");
       return;
     }
 
@@ -3879,7 +4252,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     const wavePreset = ui.wavePreset?.value || "d";
     const cur = estimateEflBflParaxial(lens.surfaces, wavePreset).efl;
     if (!Number.isFinite(cur) || cur <= 0) {
-      if (ui.footerWarn) ui.footerWarn.textContent = "Scale→FL: current EFL not solvable (try a valid stop + lens).";
+      setFooterWarn("Scale→FL: current EFL not solvable (try a valid stop + lens).");
       return;
     }
 
@@ -3901,20 +4274,20 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     renderAll();
     scheduleRenderPreview();
 
-    if (ui.footerWarn) ui.footerWarn.textContent = `Scale→FL: EFL ${cur.toFixed(2)} → target ${target.toFixed(2)} (k=${k.toFixed(4)}).`;
+    setFooterWarn(`Scale→FL: EFL ${cur.toFixed(2)} → target ${target.toFixed(2)} (k=${k.toFixed(4)}).`);
   }
 
   function setTargetTStop() {
     const wavePreset = ui.wavePreset?.value || "d";
     const { efl } = estimateEflBflParaxial(lens.surfaces, wavePreset);
     if (!Number.isFinite(efl) || efl <= 0) {
-      if (ui.footerWarn) ui.footerWarn.textContent = "Set T: EFL unknown (try Scale→FL or fix geometry).";
+      setFooterWarn("Set T: EFL unknown (try Scale→FL or fix geometry).");
       return;
     }
 
     const stopIdx = findStopSurfaceIndex(lens.surfaces);
     if (stopIdx < 0) {
-      if (ui.footerWarn) ui.footerWarn.textContent = "Set T: no STOP surface marked.";
+      setFooterWarn("Set T: no STOP surface marked.");
       return;
     }
 
@@ -3930,7 +4303,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     renderAll();
     scheduleRenderPreview();
 
-    if (ui.footerWarn) ui.footerWarn.textContent = `Set T: stop ap → ${lens.surfaces[stopIdx].ap.toFixed(2)}mm (semi-diam) for T${targetT.toFixed(2)} @ EFL ${efl.toFixed(2)}mm.`;
+    setFooterWarn(`Set T: stop ap → ${lens.surfaces[stopIdx].ap.toFixed(2)}mm (semi-diam) for T${targetT.toFixed(2)} @ EFL ${efl.toFixed(2)}mm.`);
   }
 
   // -------------------- New Lens modal --------------------
@@ -4030,7 +4403,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       if (document.fullscreenElement) await document.exitFullscreen();
       else await pane.requestFullscreen();
     } catch (e) {
-      if (ui.footerWarn) ui.footerWarn.textContent = `Fullscreen failed: ${e?.message || e}`;
+      setFooterWarn(`Fullscreen failed: ${e?.message || e}`);
     }
   }
 
@@ -4070,12 +4443,12 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         preview.imgData = id.data;
         preview.ready = true;
 
-        if (ui.footerWarn) ui.footerWarn.textContent = `Preview image loaded: ${preview.imgCanvas.width}×${preview.imgCanvas.height}`;
+        setFooterWarn(`Preview image loaded: ${preview.imgCanvas.width}×${preview.imgCanvas.height}`);
         scheduleRenderPreview();
         resolve(true);
       };
       img.onerror = (e) => {
-        if (ui.footerWarn) ui.footerWarn.textContent = `Preview image load failed: ${url}`;
+        setFooterWarn(`Preview image load failed: ${url}`);
         reject(e);
       };
       img.src = url + (url.includes("?") ? "&" : "?") + "t=" + Date.now();
@@ -4104,7 +4477,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       toast("Loaded lens JSON");
       return true;
     } catch (e) {
-      if (ui.footerWarn) ui.footerWarn.textContent = `Lens JSON load failed: ${url} (${e?.message || e})`;
+      setFooterWarn(`Lens JSON load failed: ${url} (${e?.message || e})`);
       return false;
     }
   }
@@ -4120,7 +4493,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         toast("Loaded lens JSON (file)");
         resolve(true);
       } catch (e) {
-        if (ui.footerWarn) ui.footerWarn.textContent = `Lens JSON parse failed: ${e?.message || e}`;
+        setFooterWarn(`Lens JSON parse failed: ${e?.message || e}`);
         reject(e);
       }
     };
@@ -4146,7 +4519,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       }, 0);
       toast("Saved lens JSON");
     } catch (e) {
-      if (ui.footerWarn) ui.footerWarn.textContent = `Save failed: ${e?.message || e}`;
+      setFooterWarn(`Save failed: ${e?.message || e}`);
     }
   }
 
@@ -4322,10 +4695,18 @@ function wireUI() {
 
 // -------------------- boot --------------------
 function boot() {
+  dbg("init start");
   applyViewerModeUi();
   wireUI();
   bindViewControls();
   bindPreviewViewControls();
+
+  if (!canvas || !ctx) {
+    console.error("[viewer] init failed: missing #canvas or 2D context");
+    setStatus("Viewer error: #canvas ontbreekt.");
+    setFooterWarn("Kan rays-pane niet initialiseren.");
+    return;
+  }
 
   // default sensor preset -> use current select or Mini LF
   if (ui.sensorPreset && SENSOR_PRESETS?.[ui.sensorPreset.value]) applyPreset(ui.sensorPreset.value);
@@ -4346,6 +4727,7 @@ function boot() {
   // load default assets (non-blocking)
   loadPreviewImageFromURL(DEFAULT_PREVIEW_URL).catch(() => {});
   loadLensFromURL(DEFAULT_LENS_URL).catch(() => {});
+  dbg("init end");
 }
 
 boot();
