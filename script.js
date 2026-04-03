@@ -325,6 +325,79 @@ if (!SENSOR_PRESETS[ui.sensorPreset.value]) ui.sensorPreset.value = "ARRI Alexa 
     defaultWide: 24,
     defaultTele: 70,
   };
+  const ZOOM_GROUP_ROLE_DEFAULTS = {
+    fixed_front: {
+      role: "fixed_front",
+      enabled: true,
+      moveWithZoom: false,
+      moveWithFocus: false,
+      lockGeometry: false,
+      zoomMode: "fixed",
+      startOffset: 0,
+      endOffset: 0,
+    },
+    variator: {
+      role: "variator",
+      enabled: true,
+      moveWithZoom: true,
+      moveWithFocus: false,
+      lockGeometry: false,
+      zoomMode: "linear",
+      startOffset: 0,
+      endOffset: -6,
+    },
+    compensator: {
+      role: "compensator",
+      enabled: true,
+      moveWithZoom: true,
+      moveWithFocus: false,
+      lockGeometry: false,
+      zoomMode: "linear",
+      startOffset: 0,
+      endOffset: 4,
+    },
+    relay: {
+      role: "relay",
+      enabled: true,
+      moveWithZoom: false,
+      moveWithFocus: false,
+      lockGeometry: false,
+      zoomMode: "fixed",
+      startOffset: 0,
+      endOffset: 0,
+    },
+    fixed_rear: {
+      role: "fixed_rear",
+      enabled: true,
+      moveWithZoom: false,
+      moveWithFocus: false,
+      lockGeometry: false,
+      zoomMode: "fixed",
+      startOffset: 0,
+      endOffset: 0,
+    },
+    focus: {
+      role: "focus",
+      enabled: true,
+      moveWithZoom: false,
+      moveWithFocus: true,
+      lockGeometry: false,
+      zoomMode: "fixed",
+      startOffset: 0,
+      endOffset: 0,
+    },
+  };
+
+  function normalizeGroupRole(v, fallback = "fixed_front") {
+    const k = String(v || "").trim().toLowerCase();
+    if (k && Object.prototype.hasOwnProperty.call(ZOOM_GROUP_ROLE_DEFAULTS, k)) return k;
+    return Object.prototype.hasOwnProperty.call(ZOOM_GROUP_ROLE_DEFAULTS, fallback) ? fallback : "fixed_front";
+  }
+
+  function groupRoleDefaults(role) {
+    const key = normalizeGroupRole(role, "fixed_front");
+    return clone(ZOOM_GROUP_ROLE_DEFAULTS[key] || ZOOM_GROUP_ROLE_DEFAULTS.fixed_front);
+  }
 
   function normalizeGroupId(v, fallback = "") {
     const raw = String(v || "").trim().toLowerCase();
@@ -650,20 +723,30 @@ function warnMissingGlass(name) {
     const src = raw && typeof raw === "object" ? raw : {};
     const gid = normalizeGroupId(src.id ?? src.groupId ?? src.group ?? src.name, fallbackId);
     const z = src.zoom && typeof src.zoom === "object" ? src.zoom : {};
+    const role = normalizeGroupRole(src.role ?? src.groupRole ?? src.group_role ?? "fixed_front", "fixed_front");
+    const defs = groupRoleDefaults(role);
     const startOffset = Number.isFinite(Number(z.startOffset ?? src.startOffset))
       ? Number(z.startOffset ?? src.startOffset)
-      : 0;
+      : Number(defs.startOffset || 0);
     const endOffset = Number.isFinite(Number(z.endOffset ?? src.endOffset))
       ? Number(z.endOffset ?? src.endOffset)
       : startOffset;
     return {
       id: gid,
       name: String(src.name || gid),
-      role: String(src.role ?? src.groupRole ?? src.group_role ?? ""),
-      enabled: boolLike(src.enabled, true),
-      moveWithZoom: boolLike(src.moveWithZoom, true),
+      role,
+      enabled: Object.prototype.hasOwnProperty.call(src, "enabled") ? boolLike(src.enabled, !!defs.enabled) : !!defs.enabled,
+      moveWithZoom: Object.prototype.hasOwnProperty.call(src, "moveWithZoom")
+        ? boolLike(src.moveWithZoom, !!defs.moveWithZoom)
+        : !!defs.moveWithZoom,
+      moveWithFocus: Object.prototype.hasOwnProperty.call(src, "moveWithFocus")
+        ? boolLike(src.moveWithFocus, !!defs.moveWithFocus)
+        : !!defs.moveWithFocus,
+      lockGeometry: Object.prototype.hasOwnProperty.call(src, "lockGeometry")
+        ? boolLike(src.lockGeometry, !!defs.lockGeometry)
+        : !!defs.lockGeometry,
       zoom: {
-        mode: normalizeZoomMode(z.mode ?? src.zoomMode ?? "fixed"),
+        mode: normalizeZoomMode(z.mode ?? src.zoomMode ?? defs.zoomMode ?? "fixed"),
         startOffset,
         endOffset,
       },
@@ -757,6 +840,29 @@ function warnMissingGlass(name) {
       surfaces: Array.isArray(obj?.surfaces) ? obj.surfaces : [],
       groups: clone(rawGroups),
       zoomConfig: clone(rawZoomConfig),
+      viewState: {
+        focusMode: String(
+          obj?.focusMode
+            ?? obj?.focus?.mode
+            ?? obj?.focusState?.mode
+            ?? obj?.zoomConfig?.focusMode
+            ?? ""
+        ).trim().toLowerCase(),
+        sensorOffset: num(
+          obj?.sensorOffset
+            ?? obj?.focus?.sensorOffset
+            ?? obj?.focusState?.sensorOffset
+            ?? obj?.zoomConfig?.sensorOffset,
+          NaN
+        ),
+        lensFocus: num(
+          obj?.lensFocus
+            ?? obj?.focus?.lensFocus
+            ?? obj?.focusState?.lensFocus
+            ?? obj?.zoomConfig?.lensFocus,
+          NaN
+        ),
+      },
     };
 
     safe.surfaces = safe.surfaces.map((s) => {
@@ -821,6 +927,10 @@ function warnMissingGlass(name) {
     if (!lensObj || !Array.isArray(lensObj.surfaces)) return lensObj;
     lensObj.groups = sanitizeZoomGroupMap(lensObj.groups);
     lensObj.zoomConfig = sanitizeZoomConfig(lensObj.zoomConfig);
+    dbg("ensureLensZoomModel:start", {
+      groupsIn: Object.keys(lensObj.groups || {}).length,
+      surfaces: lensObj.surfaces.length,
+    });
 
     for (let i = 0; i < lensObj.surfaces.length; i++) {
       const s = lensObj.surfaces[i];
@@ -832,23 +942,35 @@ function warnMissingGlass(name) {
 
       s.groupId = gid;
 
+      const sRole = normalizeGroupRole(s?.groupRole, t === "IMS" ? "fixed_rear" : "fixed_front");
       if (!lensObj.groups[gid]) {
+        const defs = groupRoleDefaults(sRole);
         lensObj.groups[gid] = sanitizeZoomGroup(
           {
             id: gid,
-            enabled: true,
-            moveWithZoom: t === "OBJ" || t === "IMS" ? false : true,
-            zoom: { mode: "fixed", startOffset: 0, endOffset: 0 },
+            role: sRole,
+            enabled: defs.enabled,
+            moveWithZoom: t === "OBJ" || t === "IMS" ? false : !!defs.moveWithZoom,
+            moveWithFocus: !!defs.moveWithFocus,
+            lockGeometry: !!defs.lockGeometry,
+            zoom: { mode: defs.zoomMode || "fixed", startOffset: defs.startOffset || 0, endOffset: defs.endOffset || 0 },
           },
           gid
         );
       }
+      s.groupRole = sRole;
       if (t === "OBJ" || t === "IMS") {
         s.moveWithZoom = false;
+        s.moveWithFocus = false;
       } else if (Object.prototype.hasOwnProperty.call(s, "moveWithZoom")) {
         s.moveWithZoom = !!s.moveWithZoom;
       } else {
         s.moveWithZoom = lensObj.groups[gid].moveWithZoom !== false;
+      }
+      if (Object.prototype.hasOwnProperty.call(s, "moveWithFocus")) {
+        s.moveWithFocus = !!s.moveWithFocus;
+      } else {
+        s.moveWithFocus = lensObj.groups[gid].moveWithFocus === true;
       }
     }
 
@@ -873,6 +995,15 @@ function warnMissingGlass(name) {
       cleanedOffsets[gid] = Number.isFinite(n) ? n : 0;
     }
     lensObj.zoomConfig.appliedGroupOffsets = cleanedOffsets;
+    const selectedGroupId = normalizeGroupId(lensObj.zoomConfig.selectedGroupId, "");
+    if (!selectedGroupId || !lensObj.groups[selectedGroupId]) {
+      lensObj.zoomConfig.selectedGroupId = Object.keys(lensObj.groups || {})[0] || "fixed_front";
+    }
+    dbg("ensureLensZoomModel:end", {
+      groupsOut: Object.keys(lensObj.groups || {}).length,
+      selected: lensObj.zoomConfig?.selectedGroupId || "",
+      offsets: Object.keys(cleanedOffsets || {}).length,
+    });
     return lensObj;
   }
 
@@ -990,8 +1121,12 @@ function warnMissingGlass(name) {
     let tir = 0;
     let invalid = 0;
     const traces = [];
-    for (const ray of rays) {
-      const tr = traceRayForward(clone(ray), lens.surfaces, wavePreset);
+    for (let i = 0; i < rays.length; i++) {
+      const ray = rays[i];
+      const tr = traceRayForward(clone(ray), lens.surfaces, wavePreset, {
+        visualFallback: true,
+        logTrace: i === 0,
+      });
       traces.push(tr);
       if (!tr) {
         invalid++;
@@ -1006,6 +1141,7 @@ function warnMissingGlass(name) {
   }
 
   function evaluateCurrentRayUsability(label = "usability") {
+    dbg("evaluateCurrentRayUsability:start", { label });
     const stats = getTraceStatsForCurrentState(label);
     const total = Math.max(0, Number(stats?.total || 0));
     const valid = Math.max(0, Number(stats?.valid || 0));
@@ -1014,7 +1150,7 @@ function warnMissingGlass(name) {
     const invalid = Math.max(0, Number(stats?.invalid || 0));
     const visiblePct = total > 0 ? (100 * valid) / total : 0;
     const vignettePct = total > 0 ? (100 * vignetted) / total : 0;
-    return {
+    const out = {
       ...stats,
       total,
       valid,
@@ -1024,6 +1160,16 @@ function warnMissingGlass(name) {
       visiblePct,
       vignettePct,
     };
+    dbg("evaluateCurrentRayUsability:end", {
+      label,
+      valid: out.valid,
+      vignetted: out.vignetted,
+      tir: out.tir,
+      invalid: out.invalid,
+      total: out.total,
+      visiblePct: Number(out.visiblePct.toFixed(1)),
+    });
+    return out;
   }
 
   function isStatsBetter(candidate, currentBest) {
@@ -1278,6 +1424,14 @@ function warnMissingGlass(name) {
       if (ui.zoomTeleFL) ui.zoomTeleFL.value = Number(lens?.zoomConfig?.teleFL ?? ZOOM_VIEWER_CFG.defaultTele).toFixed(2);
       if (ui.zoomPos) ui.zoomPos.value = String(Math.round(clamp(num(lens?.zoomConfig?.pos, 0), 0, 1) * 100));
       if (ui.zoomAutoFocus) ui.zoomAutoFocus.checked = lens?.zoomConfig?.autoFocusAfterZoom !== false;
+      const fm = String(lens?.viewState?.focusMode || "");
+      if (ui.focusMode && (fm === "lens" || fm === "cam")) ui.focusMode.value = fm;
+      if (ui.sensorOffset && Number.isFinite(lens?.viewState?.sensorOffset)) {
+        ui.sensorOffset.value = Number(lens.viewState.sensorOffset).toFixed(3);
+      }
+      if (ui.lensFocus && Number.isFinite(lens?.viewState?.lensFocus)) {
+        ui.lensFocus.value = Number(lens.viewState.lensFocus).toFixed(3);
+      }
 
       buildTable();
       refreshGroupManagerUi("loadLens");
@@ -1314,6 +1468,7 @@ function warnMissingGlass(name) {
       console.log("lensFocus:", Number(ui.lensFocus?.value || 0));
       console.log("sensorOffset:", Number(ui.sensorOffset?.value || 0));
       console.log("zoomPos:", Number(ui.zoomPos?.value || 0));
+      console.log("appliedGroupOffsets:", clone(lens?.zoomConfig?.appliedGroupOffsets || {}));
       console.log("valid rays:", Number(s?.valid || 0));
       console.log("vignetted rays:", Number(s?.vignetted || 0));
       console.log("tir count:", Number(s?.tir || 0));
@@ -1662,7 +1817,18 @@ function warnMissingGlass(name) {
         if (t !== "IMS") surfaces[i].vx += lensShift;
       }
     }
-
+    if (DEBUG_VIEWER) {
+      const first = surfaces?.[0];
+      const last = surfaces?.[surfaces.length - 1];
+      dbg("computeVertices:end", {
+        lensShift,
+        sensorX,
+        zoomOffsetCount: zoomOffsets ? Object.keys(zoomOffsets).length : 0,
+        firstVx: Number(first?.vx || 0),
+        lastVx: Number(last?.vx || 0),
+        imsAt: Number((surfaces?.find((s) => String(s?.type || "").toUpperCase() === "IMS") || {}).vx || 0),
+      });
+    }
     return x;
   }
 
@@ -1795,7 +1961,7 @@ function warnMissingGlass(name) {
 
   // -------------------- physical sanity clamps --------------------
   const AP_SAFETY = 0.90;
-  const AP_MAX_PLANE = 30.0;
+  const AP_MAX_PLANE = 45.0;
   const AP_MIN = 0.01;
 
   function maxApForSurface(s) {
@@ -1856,12 +2022,13 @@ function warnMissingGlass(name) {
   // -------------------- tracing --------------------
 function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   const skipIMS = !!opts.skipIMS;
+  const visualFallback = opts.visualFallback !== false;
+  const logTrace = !!opts.logTrace;
 
   let pts = [];
   let vignetted = false;
   let tir = false;
 
-  // ✅ teken altijd vanaf ray start
   pts.push({ x: ray.p.x, y: ray.p.y });
 
   let nBefore = 1.0;
@@ -1869,17 +2036,45 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
   for (let i = 0; i < surfaces.length; i++) {
     const s = surfaces[i];
     const type = String(s?.type || "").toUpperCase();
+    const isOBJ = type === "OBJ";
     const isIMS = type === "IMS";
     const isMECH = type === "MECH" || type === "BAFFLE" || type === "HOUSING";
 
+    if (isOBJ) continue;
     if (skipIMS && isIMS) continue;
 
-    const hitInfo = intersectSurface(ray, s);
-    if (!hitInfo) { vignetted = true; break; }
+    let hitInfo = intersectSurface(ray, s);
+    if (!hitInfo) {
+      vignetted = true;
+      if (!visualFallback) break;
+      const xSurf = Number(s?.vx);
+      if (Number.isFinite(xSurf)) {
+        let xHit = xSurf;
+        let yHit = Number(ray?.p?.y || 0);
+        const dx = Number(ray?.d?.x || 0);
+        if (Math.abs(dx) > 1e-12) {
+          const tPlane = (xSurf - ray.p.x) / dx;
+          if (Number.isFinite(tPlane) && tPlane > 1e-9) {
+            yHit = ray.p.y + ray.d.y * tPlane;
+          } else {
+            xHit = ray.p.x + 0.5;
+          }
+        } else {
+          xHit = ray.p.x + 0.5;
+        }
+        const missHit = { x: xHit, y: yHit };
+        pts.push(missHit);
+        ray = { p: missHit, d: ray.d };
+      }
+      break;
+    }
 
     pts.push(hitInfo.hit);
 
-    if (!isIMS && hitInfo.vignetted) { vignetted = true; break; }
+    if (!isIMS && hitInfo.vignetted) {
+      vignetted = true;
+      if (!visualFallback) break;
+    }
 
     if (isIMS || isMECH) {
       ray = { p: hitInfo.hit, d: ray.d };
@@ -1895,10 +2090,25 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     }
 
     const newDir = refract(ray.d, hitInfo.normal, nBefore, nAfter);
-    if (!newDir) { tir = true; break; }
+    if (!newDir) {
+      tir = true;
+      if (!visualFallback) break;
+      ray = { p: hitInfo.hit, d: ray.d };
+      continue;
+    }
 
     ray = { p: hitInfo.hit, d: newDir };
     nBefore = nAfter;
+  }
+
+  if (logTrace) {
+    dbg("traceRayForward", {
+      startX: Number(pts?.[0]?.x || 0),
+      pts: pts.length,
+      vignetted,
+      tir,
+      endX: Number(ray?.p?.x || 0),
+    });
   }
 
   return { pts, vignetted, tir, endRay: ray };
