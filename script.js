@@ -120,6 +120,20 @@
     setText(ui.footerWarn, msg || "");
   }
 
+  function setTextSafe(el, value) {
+    return setText(el, value);
+  }
+
+  function setClassSafe(el, className, enabled) {
+    return toggleClassSafe(el, className, enabled);
+  }
+
+  function showWarn(msg) {
+    const text = String(msg || "");
+    setFooterWarn(text);
+    if (text) console.warn("[viewer]", text);
+  }
+
   // -------------------- UI --------------------
   const ui = {
     toolbar: $(".toolbar"),
@@ -719,6 +733,11 @@ function warnMissingGlass(name) {
   }
 
   function sanitizeLens(obj) {
+    dbg("sanitizeLens:start", {
+      hasSurfaces: Array.isArray(obj?.surfaces),
+      hasGroups: !!(obj?.groups || obj?.zoomGroups || obj?.groupMap || obj?.zoom?.groups),
+      hasZoom: !!(obj?.zoomConfig || obj?.zoom || obj?.zoomState),
+    });
     const rawGroups =
       (obj?.groups && typeof obj.groups === "object") ? obj.groups
       : (obj?.zoomGroups && typeof obj.zoomGroups === "object") ? obj.zoomGroups
@@ -789,6 +808,12 @@ function warnMissingGlass(name) {
     safe.surfaces.forEach((s) => { s.glass = resolveGlassName(s.glass); });
 
     ensureLensZoomModel(safe);
+    dbg("sanitizeLens:end", {
+      surfaces: safe.surfaces.length,
+      groups: Object.keys(safe.groups || {}).length,
+      zoomPos: safe.zoomConfig?.pos ?? 0,
+      enabled: safe.zoomConfig?.enabled !== false,
+    });
     return safe;
   }
 
@@ -943,6 +968,12 @@ function warnMissingGlass(name) {
     }
   }
 
+  function refreshGroupManagerUi(reason = "runtime") {
+    const groupCount = Object.keys(lens?.groups || {}).length;
+    dbg("refreshGroupManagerUi", { reason, groupCount });
+    return { ok: true, groupCount };
+  }
+
   function getTraceStatsForCurrentState(label = "current") {
     const fieldAngle = Number(ui.fieldAngle?.value || 0);
     const rayCount = Math.max(3, Number(ui.rayCount?.value || 31));
@@ -974,6 +1005,36 @@ function warnMissingGlass(name) {
     return { label, rays, traces, valid, vignetted, tir, invalid, total: rays.length, focusMode, sensorX, lensShift, fieldAngle, rayCount, wavePreset };
   }
 
+  function evaluateCurrentRayUsability(label = "usability") {
+    const stats = getTraceStatsForCurrentState(label);
+    const total = Math.max(0, Number(stats?.total || 0));
+    const valid = Math.max(0, Number(stats?.valid || 0));
+    const vignetted = Math.max(0, Number(stats?.vignetted || 0));
+    const tir = Math.max(0, Number(stats?.tir || 0));
+    const invalid = Math.max(0, Number(stats?.invalid || 0));
+    const visiblePct = total > 0 ? (100 * valid) / total : 0;
+    const vignettePct = total > 0 ? (100 * vignetted) / total : 0;
+    return {
+      ...stats,
+      total,
+      valid,
+      vignetted,
+      tir,
+      invalid,
+      visiblePct,
+      vignettePct,
+    };
+  }
+
+  function isStatsBetter(candidate, currentBest) {
+    if (!candidate) return false;
+    if (!currentBest) return true;
+    if (candidate.valid !== currentBest.valid) return candidate.valid > currentBest.valid;
+    if (candidate.vignetted !== currentBest.vignetted) return candidate.vignetted < currentBest.vignetted;
+    if (candidate.tir !== currentBest.tir) return candidate.tir < currentBest.tir;
+    return candidate.invalid < currentBest.invalid;
+  }
+
   function captureViewerStateSnapshot() {
     return {
       lens: clone(lens),
@@ -999,9 +1060,17 @@ function warnMissingGlass(name) {
     if (ui.zoomAutoFocus) ui.zoomAutoFocus.checked = !!state.zoomAutoFocus;
     sanitizeRuntimeViewerState();
     buildTable();
+    refreshGroupManagerUi("restore-state");
     applySensorToIMS();
     updateZoomReadouts();
-    applyZoomState(num(ui.zoomPos?.value, 0) / 100, { render: false, syncUi: true, autoFocus: false });
+    applyZoomState(num(ui.zoomPos?.value, 0) / 100, {
+      render: false,
+      save: false,
+      syncUi: true,
+      toast: false,
+      enforceStepClamp: false,
+      autoFocus: false,
+    });
     return true;
   }
 
@@ -1019,88 +1088,148 @@ function warnMissingGlass(name) {
     }
   }
 
-  function runViewerRecovery(reason = "unknown", baseline = null) {
-    if (_recoveryInProgress) return false;
+  function runViewerAutofocusRecovery(opts = null) {
+    const o = opts || {};
+    const labelPrefix = String(o.labelPrefix || "viewer-af");
+    dbg("runViewerAutofocusRecovery:start", { labelPrefix });
+
+    const beforeState = captureViewerStateSnapshot();
+    let bestStats = evaluateCurrentRayUsability(`${labelPrefix}:baseline`);
+    let bestState = captureViewerStateSnapshot();
+
+    const tryMode = (mode) => {
+      restoreViewerStateSnapshot(beforeState);
+      const ok = runAutoFocusRecovery(mode);
+      sanitizeRuntimeViewerState();
+      const stats = evaluateCurrentRayUsability(`${labelPrefix}:${mode}`);
+      dbg("runViewerAutofocusRecovery:mode", {
+        mode,
+        ok,
+        valid: stats.valid,
+        total: stats.total,
+      });
+      if (isStatsBetter(stats, bestStats)) {
+        bestStats = stats;
+        bestState = captureViewerStateSnapshot();
+      }
+    };
+
+    tryMode("lens");
+    tryMode("cam");
+    restoreViewerStateSnapshot(bestState);
+
+    dbg("runViewerAutofocusRecovery:end", {
+      labelPrefix,
+      valid: bestStats.valid,
+      total: bestStats.total,
+      visiblePct: bestStats.visiblePct,
+    });
+    return bestStats;
+  }
+
+  function stabilizeViewerAfterLoad(opts = null) {
+    const o = opts || {};
+    const reason = String(o.reason || "load");
+    const baselineStats = o.baseline || evaluateCurrentRayUsability(`stabilize:${reason}:baseline`);
+    if (_recoveryInProgress) return baselineStats;
+
     _recoveryInProgress = true;
     try {
-      console.warn("[viewer] recovery triggered:", reason);
-      const base = baseline || getTraceStatsForCurrentState("baseline");
-      const original = captureViewerStateSnapshot();
-      let best = { state: original, stats: base, label: "baseline" };
-      const candidates = [];
+      dbg("stabilizeViewerAfterLoad:start", { reason });
 
-      const runCandidate = (label, fn) => {
-        try {
-          if (typeof fn === "function") fn();
-          sanitizeRuntimeViewerState();
-          const stats = getTraceStatsForCurrentState(label);
-          candidates.push({ label, stats, state: captureViewerStateSnapshot() });
-          const better =
-            stats.valid > best.stats.valid ||
-            (stats.valid === best.stats.valid && stats.vignetted < best.stats.vignetted) ||
-            (stats.valid === best.stats.valid && stats.vignetted === best.stats.vignetted && stats.tir < best.stats.tir);
-          if (better) best = { state: captureViewerStateSnapshot(), stats, label };
-        } catch (e) {
-          console.warn("[viewer] recovery candidate failed", label, e);
-        }
-      };
-
-      runCandidate("current", null);
-      runCandidate("autofocus-lens", () => { runAutoFocusRecovery("lens"); });
-      runCandidate("cam-zero", () => {
-        if (ui.focusMode) ui.focusMode.value = "cam";
-        if (ui.sensorOffset) ui.sensorOffset.value = "0";
-        if (ui.lensFocus) ui.lensFocus.value = "0";
-      });
-      runCandidate("autofocus-cam", () => { runAutoFocusRecovery("cam"); });
-      runCandidate("lens-zero", () => {
-        if (ui.focusMode) ui.focusMode.value = "lens";
-        if (ui.lensFocus) ui.lensFocus.value = "0";
-        if (ui.sensorOffset) ui.sensorOffset.value = "0";
-      });
-
+      const baselineState = captureViewerStateSnapshot();
+      let bestStats = baselineStats;
+      let bestState = baselineState;
       const zNow = clamp(num(ui.zoomPos?.value, 0), 0, 100) / 100;
-      const zSamples = Array.from(new Set([zNow, 0, 0.35, 0.5, 0.75, 1]));
-      for (const zp of zSamples) {
-        runCandidate(`zoom-${Math.round(zp * 100)}`, () => {
-          applyZoomState(zp, { render: false, syncUi: true, autoFocus: false });
+      const samples = Array.from(new Set([zNow, 0, 0.15, 0.30, 0.50, 0.70, 0.85, 1.0]));
+      const visibleSamples = [];
+
+      for (const z of samples) {
+        restoreViewerStateSnapshot(baselineState);
+        applyZoomState(z, {
+          render: false,
+          save: false,
+          syncUi: true,
+          toast: false,
+          enforceStepClamp: false,
+          autoFocus: false,
         });
+        sanitizeRuntimeViewerState();
+        let stats = evaluateCurrentRayUsability(`stabilize:${reason}:zoom-${Math.round(z * 100)}`);
+        if (stats.valid > 0) visibleSamples.push(z);
+
+        const afStats = runViewerAutofocusRecovery({
+          labelPrefix: `stabilize:${reason}:zoom-${Math.round(z * 100)}:af`,
+        });
+        if (afStats.valid > 0) visibleSamples.push(z);
+        stats = isStatsBetter(afStats, stats) ? afStats : stats;
+
+        if (isStatsBetter(stats, bestStats)) {
+          bestStats = stats;
+          bestState = captureViewerStateSnapshot();
+        }
       }
 
-      runCandidate("zoom-disabled", () => {
+      if (bestStats.valid <= 0) {
+        restoreViewerStateSnapshot(baselineState);
         ensureLensZoomModel(lens);
         lens.zoomConfig.enabled = false;
-      });
-      runCandidate("zoom-reenabled", () => {
-        ensureLensZoomModel(lens);
-        lens.zoomConfig.enabled = true;
-        applyZoomState(num(ui.zoomPos?.value, 0) / 100, { render: false, syncUi: true, autoFocus: false });
-      });
+        sanitizeRuntimeViewerState();
+        let noZoomStats = evaluateCurrentRayUsability(`stabilize:${reason}:zoom-disabled`);
+        const noZoomAfStats = runViewerAutofocusRecovery({
+          labelPrefix: `stabilize:${reason}:zoom-disabled:af`,
+        });
+        noZoomStats = isStatsBetter(noZoomAfStats, noZoomStats) ? noZoomAfStats : noZoomStats;
+        if (isStatsBetter(noZoomStats, bestStats)) {
+          bestStats = noZoomStats;
+          bestState = captureViewerStateSnapshot();
+          showWarn("Zoom offsets tijdelijk uitgeschakeld voor zichtbare rays.");
+        }
+      }
 
-      restoreViewerStateSnapshot(best.state);
-      setFooterWarn(
-        best.stats.valid > 0
-          ? `Recovery actief (${reason}) → ${best.label}: ${best.stats.valid}/${best.stats.total} geldige rays`
-          : `Recovery geprobeerd (${reason}) maar nog geen geldige rays`
+      restoreViewerStateSnapshot(bestState);
+
+      const minVis = visibleSamples.length ? Math.round(Math.min(...visibleSamples) * 100) : 0;
+      const maxVis = visibleSamples.length ? Math.round(Math.max(...visibleSamples) * 100) : 100;
+      const visTxt = `Visible: ${minVis}% - ${maxVis}%`;
+      showWarn(
+        bestStats.valid > 0
+          ? `${visTxt} • herstel gekozen met ${bestStats.valid}/${bestStats.total} geldige rays`
+          : `${visTxt} • geen geldige rays na stabilisatie`
       );
-      dbg("recovery result", {
+
+      dbg("stabilizeViewerAfterLoad:end", {
         reason,
-        chosen: best.label,
-        valid: best.stats.valid,
-        total: best.stats.total,
-        candidates: candidates.map((c) => `${c.label}:${c.stats.valid}/${c.stats.total}`).join(", "),
+        valid: bestStats.valid,
+        total: bestStats.total,
+        visibleRange: `${minVis}-${maxVis}`,
       });
-      return best.stats.valid > 0;
+      return bestStats;
     } finally {
       _recoveryInProgress = false;
     }
   }
 
+  function runViewerRecovery(reason = "unknown", baseline = null) {
+    console.warn("[viewer] recovery triggered:", reason);
+    const stats = stabilizeViewerAfterLoad({ reason, baseline: baseline || null });
+    return !!stats && stats.valid > 0;
+  }
+
   function applyZoomState(pos01, opts = null) {
     const o = opts || {};
     sanitizeRuntimeViewerState();
-    const p = clamp(num(pos01, lens?.zoomConfig?.pos ?? 0), 0, 1);
-    dbg("applyZoomState", { pos: p, render: o.render !== false, autoFocus: !!o.autoFocus });
+    let p = clamp(num(pos01, lens?.zoomConfig?.pos ?? 0), 0, 1);
+    if (o.enforceStepClamp) p = Math.round(p * 100) / 100;
+    dbg("applyZoomState", {
+      pos: p,
+      render: o.render !== false,
+      autoFocus: !!o.autoFocus,
+      syncUi: o.syncUi !== false,
+      save: !!o.save,
+      toast: !!o.toast,
+      enforceStepClamp: !!o.enforceStepClamp,
+    });
 
     lens.zoomConfig.pos = p;
     lens.zoomConfig.appliedGroupOffsets = buildZoomGroupOffsets(lens, p);
@@ -1118,6 +1247,7 @@ function warnMissingGlass(name) {
         if (preview.ready) scheduleRenderPreview();
       }
     }
+    if (o.toast) toast(`Zoom state: ${Math.round(p * 100)}%`);
     return { ok: true, pos: p };
   }
 
@@ -1141,49 +1271,60 @@ function warnMissingGlass(name) {
     const fallback = captureViewerStateSnapshot();
     try {
       lens = sanitizeLens(obj);
+      ensureLensZoomModel(lens);
       selectedIndex = 0;
       clampAllApertures(lens.surfaces);
-      sanitizeRuntimeViewerState();
       if (ui.zoomWideFL) ui.zoomWideFL.value = Number(lens?.zoomConfig?.wideFL ?? ZOOM_VIEWER_CFG.defaultWide).toFixed(2);
       if (ui.zoomTeleFL) ui.zoomTeleFL.value = Number(lens?.zoomConfig?.teleFL ?? ZOOM_VIEWER_CFG.defaultTele).toFixed(2);
       if (ui.zoomPos) ui.zoomPos.value = String(Math.round(clamp(num(lens?.zoomConfig?.pos, 0), 0, 1) * 100));
       if (ui.zoomAutoFocus) ui.zoomAutoFocus.checked = lens?.zoomConfig?.autoFocusAfterZoom !== false;
+
       buildTable();
+      refreshGroupManagerUi("loadLens");
       applySensorToIMS();
       updateZoomReadouts();
-      applyZoomState(num(lens?.zoomConfig?.pos, 0), { render: false, syncUi: true, autoFocus: false });
-      const stats = renderAll({ source: "loadLens", allowRecovery: false });
-      if (!stats || stats.valid <= 0) {
-        runViewerRecovery("loadLens_no_valid_rays", stats || null);
-        renderAll({ source: "loadLens_recovery", allowRecovery: false });
+      applyZoomState(num(lens?.zoomConfig?.pos, 0), {
+        render: false,
+        save: false,
+        syncUi: true,
+        toast: false,
+        enforceStepClamp: false,
+        autoFocus: false,
+      });
+
+      sanitizeRuntimeViewerState();
+
+      let stats = evaluateCurrentRayUsability("loadLens:initial");
+      if (VIEWER_MODE) {
+        const afStats = runViewerAutofocusRecovery({ labelPrefix: "loadLens" });
+        if (isStatsBetter(afStats, stats)) stats = afStats;
+        const stStats = stabilizeViewerAfterLoad({ reason: "loadLens", baseline: stats });
+        if (isStatsBetter(stStats, stats)) stats = stStats;
       }
+
+      const finalStats = renderAll({ source: "loadLens", allowRecovery: true }) || stats;
       if (preview.ready) scheduleRenderPreview();
 
       const stopIdx = lens.surfaces.findIndex((s) => !!s.stop);
-      const physicalCount = lens.surfaces.filter((s) => {
-        const t = String(s?.type || "").toUpperCase();
-        return t !== "OBJ" && t !== "IMS";
-      }).length;
-      const s = _lastRenderStats || stats || getTraceStatsForCurrentState("loadLens-end") || {
-        total: 0, vignetted: 0, tir: 0, valid: 0,
-      };
-      console.groupCollapsed("[viewer] JSON load");
+      const s = _lastRenderStats || finalStats || evaluateCurrentRayUsability("loadLens:end");
+      console.group("viewer-load");
       console.log("surfaces:", lens.surfaces.length);
-      console.log("physicalSurfaces:", physicalCount);
       console.log("stopIndex:", stopIdx);
       console.log("focusMode:", String(ui.focusMode?.value || "cam"));
       console.log("lensFocus:", Number(ui.lensFocus?.value || 0));
       console.log("sensorOffset:", Number(ui.sensorOffset?.value || 0));
       console.log("zoomPos:", Number(ui.zoomPos?.value || 0));
-      console.log("rayCount:", Number(ui.rayCount?.value || 31));
-      console.log("traced/vignetted/tir/valid:", `${s.total}/${s.vignetted}/${s.tir}/${s.valid}`);
+      console.log("valid rays:", Number(s?.valid || 0));
+      console.log("vignetted rays:", Number(s?.vignetted || 0));
+      console.log("tir count:", Number(s?.tir || 0));
+      console.log("total rays:", Number(s?.total || 0));
       console.groupEnd();
       dbg("loadLens:end");
     } catch (e) {
       console.error("[viewer] loadLens failed", e);
       restoreViewerStateSnapshot(fallback);
       setStatus(`Load error: ${e?.message || e}`);
-      setFooterWarn("JSON geladen maar recovery nodig; vorige staat hersteld.");
+      showWarn("JSON geladen maar recovery nodig; vorige staat hersteld.");
       renderAll({ source: "loadLens_error", allowRecovery: false });
     }
   }
@@ -1370,6 +1511,7 @@ function warnMissingGlass(name) {
     }
 
     ensureLensZoomModel(lens);
+    refreshGroupManagerUi("table-commit");
     updateZoomReadouts();
     applyZoomState(num(lens?.zoomConfig?.pos, 0), { render: false, syncUi: false, autoFocus: false });
     applySensorToIMS();
@@ -2641,6 +2783,87 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
     });
   }
 
+  function estimateDistortionPct(traces, sensorX, fieldAngleDeg, efl) {
+    if (!Array.isArray(traces) || !Number.isFinite(sensorX) || !Number.isFinite(efl) || efl <= 0) return null;
+    const theta = Math.abs(Number(fieldAngleDeg || 0));
+    if (theta < 1e-4) return null;
+
+    const ys = [];
+    for (const tr of traces) {
+      if (!tr || tr.vignetted || tr.tir || !tr.endRay) continue;
+      const y = rayHitYAtX(tr.endRay, sensorX);
+      if (y == null || !Number.isFinite(y)) continue;
+      ys.push(Math.abs(y));
+    }
+    if (!ys.length) return null;
+    ys.sort((a, b) => a - b);
+    const actual = ys[Math.floor(ys.length / 2)];
+    const ideal = Math.abs(efl * Math.tan((theta * Math.PI) / 180));
+    if (!Number.isFinite(ideal) || ideal <= 1e-6) return null;
+    return ((actual - ideal) / ideal) * 100;
+  }
+
+  function computeViewerMetricSummary({ traces, sensorX, fieldAngle, efl, tracedCount, validCount }) {
+    const distPct = estimateDistortionPct(traces, sensorX, fieldAngle, efl);
+    const spot = spotRmsAtSensorX(traces, sensorX);
+    const sharpScore = Number.isFinite(spot?.rms) ? (1 / (1 + Math.max(0, spot.rms))) : null;
+    const sharpPct = Number.isFinite(sharpScore) ? sharpScore * 100 : null;
+    const odMm = Number(ui.prevObjDist?.value || 0);
+    const odM = Number.isFinite(odMm) && odMm > 0 ? odMm / 1000 : null;
+    const validRatio = tracedCount > 0 ? validCount / tracedCount : 0;
+    const merit = Number.isFinite(sharpScore)
+      ? (validRatio * 100 * sharpScore * (1 - Math.min(0.95, Math.abs(distPct || 0) / 150)))
+      : null;
+    const softIc = preview.usableCircle?.valid ? preview.usableCircle.diameterMm : null;
+
+    return {
+      distPct,
+      sharpPct,
+      odM,
+      merit,
+      softIc,
+      spotRms: Number.isFinite(spot?.rms) ? spot.rms : null,
+    };
+  }
+
+  function updateMetricsDisplay(payload) {
+    dbg("updateMetrics:start", payload?.source || "manual");
+    if (!payload || typeof payload !== "object") return;
+
+    setTextSafe(ui.efl, payload.eflLeft);
+    setTextSafe(ui.bfl, payload.bflLeft);
+    setTextSafe(ui.tstop, payload.tLeft);
+    setTextSafe(ui.vig, payload.vigLeft);
+    setTextSafe(ui.fov, payload.fovTxt);
+    setTextSafe(ui.cov, payload.covShort);
+
+    setTextSafe(ui.eflTop, payload.eflTop);
+    setTextSafe(ui.bflTop, payload.bflTop);
+    setTextSafe(ui.tstopTop, payload.tTop);
+    setTextSafe(ui.fovTop, payload.fovTxt);
+    setTextSafe(ui.covTop, payload.covShort);
+
+    const softIcTxt = payload.softIc == null ? "IC soft: —" : `IC soft: Ø${payload.softIc.toFixed(1)}mm`;
+    const distTxt = payload.distPct == null ? "Dist: —" : `Dist: ${payload.distPct.toFixed(2)}%`;
+    const sharpTxt = payload.sharpPct == null ? "Sharp: —" : `Sharp: ${payload.sharpPct.toFixed(1)}%`;
+    const odTxt = payload.odM == null ? "OD: —" : `OD: ${payload.odM.toFixed(2)}m`;
+    const meritTxt = payload.merit == null ? "Merit: —" : `Merit: ${payload.merit.toFixed(1)}`;
+
+    setTextSafe(ui.softIC, softIcTxt);
+    setTextSafe(ui.dist, distTxt);
+    setTextSafe(ui.sharp, sharpTxt);
+    setTextSafe(ui.od, odTxt);
+    setTextSafe(ui.merit, meritTxt);
+
+    dbg("updateMetrics:end", {
+      dist: payload.distPct,
+      sharp: payload.sharpPct,
+      od: payload.odM,
+      merit: payload.merit,
+      softIc: payload.softIc,
+    });
+  }
+
   // ===========================
   // RENDER ALL (rays pane)
   // ===========================
@@ -2748,19 +2971,27 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
       const eflTop = `EFL: ${efl == null ? "—" : efl.toFixed(2)}mm`;
       const bflTop = `BFL: ${bfl == null ? "—" : bfl.toFixed(2)}mm`;
       const tTop = `T≈ ${T == null ? "—" : `T${T.toFixed(2)}`}`;
-
-      setText(ui.efl, eflLeft);
-      setText(ui.bfl, bflLeft);
-      setText(ui.tstop, tLeft);
-      setText(ui.vig, vigLeft);
-      setText(ui.fov, fovTxt);
-      setText(ui.cov, covShort);
-
-      setText(ui.eflTop, eflTop);
-      setText(ui.bflTop, bflTop);
-      setText(ui.tstopTop, tTop);
-      setText(ui.fovTop, fovTxt);
-      setText(ui.covTop, covShort);
+      const extraMetrics = computeViewerMetricSummary({
+        traces,
+        sensorX,
+        fieldAngle,
+        efl,
+        tracedCount,
+        validCount,
+      });
+      updateMetricsDisplay({
+        source,
+        eflLeft,
+        bflLeft,
+        tLeft,
+        vigLeft,
+        fovTxt,
+        covShort,
+        eflTop,
+        bflTop,
+        tTop,
+        ...extraMetrics,
+      });
 
       if (tirCount > 0) {
         setFooterWarn(`TIR on ${tirCount} rays (check glass / curvature).`);
@@ -2780,6 +3011,10 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         efl,
         bfl,
         tstop: T,
+        distPct: extraMetrics.distPct,
+        sharpPct: extraMetrics.sharpPct,
+        odM: extraMetrics.odM,
+        merit: extraMetrics.merit,
         fov: fov ? `${fov.hfov.toFixed(2)}/${fov.vfov.toFixed(2)}/${fov.dfov.toFixed(2)}` : null,
       });
 
@@ -2829,6 +3064,7 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
         fov,
         covTxt,
         covers,
+        ...extraMetrics,
         focusMode,
         sensorX,
         lensShift,
@@ -4658,7 +4894,7 @@ function wireUI() {
   if (ui.btnPreviewFS) ui.btnPreviewFS.addEventListener("click", togglePreviewFullscreen);
   if (ui.btnPreviewRuler) ui.btnPreviewRuler.addEventListener("click", () => {
     preview.rulerOn = !preview.rulerOn;
-    ui.btnPreviewRuler.classList.toggle("isOn", preview.rulerOn);
+    setClassSafe(ui.btnPreviewRuler, "isOn", preview.rulerOn);
     drawPreviewViewport();
   });
   if (ui.btnRaysFS) ui.btnRaysFS.addEventListener("click", toggleRaysFullscreen);
@@ -4719,6 +4955,7 @@ function boot() {
   if (ui.zoomPos) ui.zoomPos.value = String(Math.round(clamp(num(lens?.zoomConfig?.pos, 0), 0, 1) * 100));
   if (ui.zoomAutoFocus) ui.zoomAutoFocus.checked = lens?.zoomConfig?.autoFocusAfterZoom !== false;
   buildTable();
+  refreshGroupManagerUi("boot");
   applySensorToIMS();
   updateZoomReadouts();
   applyZoomState(num(lens?.zoomConfig?.pos, 0), { render: false, syncUi: true, autoFocus: false });
