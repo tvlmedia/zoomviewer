@@ -20,9 +20,21 @@
     typeof structuredClone === "function" ? structuredClone(obj) : JSON.parse(JSON.stringify(obj));
 
   function num(v, fallback = 0) {
-    const s = String(v ?? "").trim().replace(",", ".");
+    const s = String(v ?? "")
+      .trim()
+      .replace(/[\u2212\u2012\u2013\u2014]/g, "-")
+      .replace(",", ".");
     const x = parseFloat(s);
     return Number.isFinite(x) ? x : fallback;
+  }
+  function boolLike(v, fallback = false) {
+    if (typeof v === "boolean") return v;
+    if (typeof v === "number") return Number.isFinite(v) ? v !== 0 : fallback;
+    const s = String(v ?? "").trim().toLowerCase();
+    if (!s) return fallback;
+    if (["1", "true", "yes", "y", "on"].includes(s)) return true;
+    if (["0", "false", "no", "n", "off"].includes(s)) return false;
+    return fallback;
   }
   function clamp01(x){ return x < 0 ? 0 : (x > 1 ? 1 : x); }
   function smoothstep(a, b, x){
@@ -71,6 +83,7 @@
 
   // -------------------- UI --------------------
   const ui = {
+    toolbar: $(".toolbar"),
     tbody: $("#surfTbody"),
     status: $("#statusText"),
 
@@ -151,6 +164,21 @@
     toastHost: $("#toastHost"),
   };
 
+  const VIEWER_MODE = true;
+  const VIEWER_HIDE_IDS = [
+    "btnAdd",
+    "btnAddElement",
+    "btnDuplicate",
+    "btnMoveUp",
+    "btnMoveDown",
+    "btnRemove",
+    "btnScaleToFocal",
+    "btnSetTStop",
+    "btnSave",
+    "btnLoadOmit",
+    "btnLoadDemo",
+  ];
+
   function toast(msg, ms = 2200) {
     if (!ui.toastHost) return;
     const d = document.createElement("div");
@@ -162,6 +190,26 @@
       d.style.transform = "translateY(6px)";
       setTimeout(() => d.remove(), 250);
     }, ms);
+  }
+
+  function hideViewerNode(el) {
+    if (!el) return;
+    const ctrl = el.closest(".ctrl");
+    const toolbarItem = ui.toolbar && ui.toolbar.contains(el) ? el.closest("button, label.fileBtn, .sep") : null;
+    const target = ctrl || toolbarItem || el;
+    target.classList.add("viewerHidden");
+  }
+
+  function applyViewerModeUi() {
+    if (!VIEWER_MODE) return;
+    document.body?.classList.add("viewerMode");
+    document.documentElement?.classList.add("viewerMode");
+    document.title = "Zoom Lens Viewer — Meridional Raytracer (2D)";
+
+    const leftHint = document.querySelector(".panelHeader .hint");
+    if (leftHint) leftHint.textContent = "Laad je builder JSON en preview wide/tele + rays.";
+
+    VIEWER_HIDE_IDS.forEach((id) => hideViewerNode(document.getElementById(id)));
   }
 
   let selectedIndex = 0;
@@ -541,7 +589,7 @@ function warnMissingGlass(name) {
   // -------------------- sanitize/load --------------------
   function sanitizeZoomGroup(raw, fallbackId = "group") {
     const src = raw && typeof raw === "object" ? raw : {};
-    const gid = normalizeGroupId(src.id, fallbackId);
+    const gid = normalizeGroupId(src.id ?? src.groupId ?? src.group ?? src.name, fallbackId);
     const z = src.zoom && typeof src.zoom === "object" ? src.zoom : {};
     const startOffset = Number.isFinite(Number(z.startOffset ?? src.startOffset))
       ? Number(z.startOffset ?? src.startOffset)
@@ -552,8 +600,9 @@ function warnMissingGlass(name) {
     return {
       id: gid,
       name: String(src.name || gid),
-      enabled: src.enabled !== false,
-      moveWithZoom: src.moveWithZoom !== false,
+      role: String(src.role ?? src.groupRole ?? src.group_role ?? ""),
+      enabled: boolLike(src.enabled, true),
+      moveWithZoom: boolLike(src.moveWithZoom, true),
       zoom: {
         mode: normalizeZoomMode(z.mode ?? src.zoomMode ?? "fixed"),
         startOffset,
@@ -564,20 +613,33 @@ function warnMissingGlass(name) {
 
   function sanitizeZoomGroupMap(rawGroups) {
     const out = {};
-    const src = rawGroups && typeof rawGroups === "object" ? rawGroups : {};
-    for (const [k, v] of Object.entries(src)) {
-      const gid = normalizeGroupId(k, normalizeGroupId(v?.id, ""));
+    let entries = [];
+    if (Array.isArray(rawGroups)) {
+      entries = rawGroups.map((g, idx) => [String(idx), g]);
+    } else if (rawGroups && typeof rawGroups === "object") {
+      entries = Object.entries(rawGroups);
+    }
+    for (const [k, v] of entries) {
+      const patch = v && typeof v === "object" ? v : {};
+      const gid = normalizeGroupId(
+        patch.id ?? patch.groupId ?? patch.group ?? patch.name ?? k,
+        normalizeGroupId(k, "")
+      );
       if (!gid) continue;
-      out[gid] = sanitizeZoomGroup(v, gid);
+      out[gid] = sanitizeZoomGroup(patch, gid);
     }
     return out;
   }
 
   function sanitizeZoomConfig(raw = {}) {
     const src = raw && typeof raw === "object" ? raw : {};
-    let wide = clamp(Math.abs(num(src.wideFL, ZOOM_VIEWER_CFG.defaultWide)), ZOOM_VIEWER_CFG.minFl, ZOOM_VIEWER_CFG.maxFl);
+    let wide = clamp(
+      Math.abs(num(src.wideFL ?? src.wide ?? src.fWide, ZOOM_VIEWER_CFG.defaultWide)),
+      ZOOM_VIEWER_CFG.minFl,
+      ZOOM_VIEWER_CFG.maxFl
+    );
     let tele = clamp(
-      Math.abs(num(src.teleFL, Math.max(wide, ZOOM_VIEWER_CFG.defaultTele))),
+      Math.abs(num(src.teleFL ?? src.tele ?? src.fTele, Math.max(wide, ZOOM_VIEWER_CFG.defaultTele))),
       ZOOM_VIEWER_CFG.minFl,
       ZOOM_VIEWER_CFG.maxFl
     );
@@ -586,7 +648,13 @@ function warnMissingGlass(name) {
     const offsets = {};
     const offsetsIn = src.appliedGroupOffsets && typeof src.appliedGroupOffsets === "object"
       ? src.appliedGroupOffsets
-      : {};
+      : (src.groupOffsets && typeof src.groupOffsets === "object"
+        ? src.groupOffsets
+        : (src.offsets && typeof src.offsets === "object" ? src.offsets : {}))
+      ;
+    const autoFocusAfterZoom = Object.prototype.hasOwnProperty.call(src, "autoFocusAfterZoom")
+      ? boolLike(src.autoFocusAfterZoom, true)
+      : boolLike(src.autoFocusOnZoom, true);
     for (const [k, v] of Object.entries(offsetsIn)) {
       const gid = normalizeGroupId(k, "");
       if (!gid) continue;
@@ -597,12 +665,86 @@ function warnMissingGlass(name) {
     return {
       wideFL: wide,
       teleFL: tele,
-      pos: clamp(num(src.pos, 0), 0, 1),
-      enabled: src.enabled !== false,
-      autoFocusAfterZoom: src.autoFocusAfterZoom !== false,
-      movementScale: clamp(num(src.movementScale, 1), 0, 6),
+      pos: clamp(num(src.pos ?? src.position ?? src.zoomPos, 0), 0, 1),
+      enabled: boolLike(src.enabled, true),
+      autoFocusAfterZoom,
+      movementScale: clamp(num(src.movementScale ?? src.zoomScale, 1), 0, 6),
       appliedGroupOffsets: offsets,
     };
+  }
+
+  function sanitizeLens(obj) {
+    const rawGroups =
+      (obj?.groups && typeof obj.groups === "object") ? obj.groups
+      : (obj?.zoomGroups && typeof obj.zoomGroups === "object") ? obj.zoomGroups
+      : (obj?.groupMap && typeof obj.groupMap === "object") ? obj.groupMap
+      : (obj?.zoom?.groups && typeof obj.zoom.groups === "object") ? obj.zoom.groups
+      : {};
+
+    const rawZoomConfig =
+      (obj?.zoomConfig && typeof obj.zoomConfig === "object") ? obj.zoomConfig
+      : (obj?.zoom && typeof obj.zoom === "object") ? obj.zoom
+      : (obj?.zoomState && typeof obj.zoomState === "object") ? obj.zoomState
+      : {};
+
+    const safe = {
+      name: String(obj?.name ?? "No name"),
+      notes: Array.isArray(obj?.notes) ? obj.notes.map(String) : (obj?.notes ? [String(obj.notes)] : []),
+      surfaces: Array.isArray(obj?.surfaces) ? obj.surfaces : [],
+      groups: clone(rawGroups),
+      zoomConfig: clone(rawZoomConfig),
+    };
+
+    safe.surfaces = safe.surfaces.map((s) => {
+      const row = {
+        type: String(s?.type ?? s?.surfaceType ?? s?.kind ?? ""),
+        R: num(s?.R ?? s?.radius ?? s?.radiusR, 0),
+        t: num(s?.t ?? s?.thickness ?? s?.distance, 0),
+        ap: num(s?.ap ?? s?.aperture ?? s?.diameter, 10),
+        glass: String(s?.glass ?? s?.material ?? s?.medium ?? "AIR"),
+        stop: boolLike(s?.stop ?? s?.isStop ?? s?.is_stop, false),
+        groupId: normalizeGroupId(s?.groupId ?? s?.group ?? s?.group_id ?? s?.zoomGroup ?? "", ""),
+        groupRole: String(s?.groupRole ?? s?.group_role ?? s?.role ?? ""),
+      };
+      if (Object.prototype.hasOwnProperty.call(s || {}, "moveWithZoom")) row.moveWithZoom = !!s.moveWithZoom;
+      if (Object.prototype.hasOwnProperty.call(s || {}, "moveWithFocus")) row.moveWithFocus = !!s.moveWithFocus;
+      if (Object.prototype.hasOwnProperty.call(s || {}, "lockGeometry")) row.lockGeometry = !!s.lockGeometry;
+      return row;
+    });
+
+    if (!Object.prototype.hasOwnProperty.call(safe.zoomConfig || {}, "wideFL") && Object.prototype.hasOwnProperty.call(obj || {}, "wideFL")) {
+      safe.zoomConfig.wideFL = obj.wideFL;
+    }
+    if (!Object.prototype.hasOwnProperty.call(safe.zoomConfig || {}, "teleFL") && Object.prototype.hasOwnProperty.call(obj || {}, "teleFL")) {
+      safe.zoomConfig.teleFL = obj.teleFL;
+    }
+    if (!Object.prototype.hasOwnProperty.call(safe.zoomConfig || {}, "pos") && Object.prototype.hasOwnProperty.call(obj || {}, "zoomPos")) {
+      safe.zoomConfig.pos = obj.zoomPos;
+    }
+
+    const firstStop = safe.surfaces.findIndex((s) => s.stop);
+    if (firstStop >= 0) safe.surfaces.forEach((s, i) => { if (i !== firstStop) s.stop = false; });
+
+    safe.surfaces.forEach((s, i) => { if (!s.type || !s.type.trim()) s.type = String(i); });
+
+    if (safe.surfaces.length >= 1) {
+      safe.surfaces[0].type = "OBJ";
+      safe.surfaces[0].t = 0.0;
+      safe.surfaces[0].groupId = "obj_fixed";
+      safe.surfaces[0].moveWithZoom = false;
+    }
+    if (safe.surfaces.length >= 1) {
+      const last = safe.surfaces[safe.surfaces.length - 1];
+      last.type = "IMS";
+      last.groupId = "ims_fixed";
+      last.moveWithZoom = false;
+    }
+
+    // keep compatibility with legacy presets / aliases
+    safe.surfaces.forEach((s) => { s.glass = resolveGlassName(s.glass); });
+
+    ensureLensZoomModel(safe);
+    return safe;
   }
 
   function ensureLensZoomModel(lensObj) {
@@ -619,13 +761,6 @@ function warnMissingGlass(name) {
       else if (!gid) gid = "fixed_front";
 
       s.groupId = gid;
-      if (t === "OBJ" || t === "IMS") {
-        s.moveWithZoom = false;
-      } else if (!Object.prototype.hasOwnProperty.call(s, "moveWithZoom")) {
-        s.moveWithZoom = true;
-      } else {
-        s.moveWithZoom = !!s.moveWithZoom;
-      }
 
       if (!lensObj.groups[gid]) {
         lensObj.groups[gid] = sanitizeZoomGroup(
@@ -637,6 +772,13 @@ function warnMissingGlass(name) {
           },
           gid
         );
+      }
+      if (t === "OBJ" || t === "IMS") {
+        s.moveWithZoom = false;
+      } else if (Object.prototype.hasOwnProperty.call(s, "moveWithZoom")) {
+        s.moveWithZoom = !!s.moveWithZoom;
+      } else {
+        s.moveWithZoom = lensObj.groups[gid].moveWithZoom !== false;
       }
     }
 
@@ -662,57 +804,6 @@ function warnMissingGlass(name) {
     }
     lensObj.zoomConfig.appliedGroupOffsets = cleanedOffsets;
     return lensObj;
-  }
-
-  function sanitizeLens(obj) {
-    const safe = {
-      name: String(obj?.name ?? "No name"),
-      notes: Array.isArray(obj?.notes) ? obj.notes.map(String) : [],
-      surfaces: Array.isArray(obj?.surfaces) ? obj.surfaces : [],
-      groups: obj?.groups && typeof obj.groups === "object" ? clone(obj.groups) : {},
-      zoomConfig: obj?.zoomConfig && typeof obj.zoomConfig === "object" ? clone(obj.zoomConfig) : {},
-    };
-
-    safe.surfaces = safe.surfaces.map((s) => {
-      const row = {
-        type: String(s?.type ?? ""),
-        R: Number(s?.R ?? 0),
-        t: Number(s?.t ?? 0),
-        ap: Number(s?.ap ?? 10),
-        glass: String(s?.glass ?? "AIR"),
-        stop: Boolean(s?.stop ?? false),
-        groupId: normalizeGroupId(s?.groupId, ""),
-        groupRole: String(s?.groupRole ?? ""),
-      };
-      if (Object.prototype.hasOwnProperty.call(s || {}, "moveWithZoom")) row.moveWithZoom = !!s.moveWithZoom;
-      if (Object.prototype.hasOwnProperty.call(s || {}, "moveWithFocus")) row.moveWithFocus = !!s.moveWithFocus;
-      if (Object.prototype.hasOwnProperty.call(s || {}, "lockGeometry")) row.lockGeometry = !!s.lockGeometry;
-      return row;
-    });
-
-    const firstStop = safe.surfaces.findIndex((s) => s.stop);
-    if (firstStop >= 0) safe.surfaces.forEach((s, i) => { if (i !== firstStop) s.stop = false; });
-
-    safe.surfaces.forEach((s, i) => { if (!s.type || !s.type.trim()) s.type = String(i); });
-
-    if (safe.surfaces.length >= 1) {
-      safe.surfaces[0].type = "OBJ";
-      safe.surfaces[0].t = 0.0;
-      safe.surfaces[0].groupId = "obj_fixed";
-      safe.surfaces[0].moveWithZoom = false;
-    }
-    if (safe.surfaces.length >= 1) {
-      const last = safe.surfaces[safe.surfaces.length - 1];
-      last.type = "IMS";
-      last.groupId = "ims_fixed";
-      last.moveWithZoom = false;
-    }
-
-    // keep compatibility with legacy presets / aliases
-    safe.surfaces.forEach((s) => { s.glass = resolveGlassName(s.glass); });
-
-    ensureLensZoomModel(safe);
-    return safe;
   }
 
   let lens = sanitizeLens(omit50ConceptV1());
@@ -862,12 +953,28 @@ function warnMissingGlass(name) {
     _focusMemo = null;
   }
 
+  function ensureGroupTableHeaderColumn() {
+    const headRow = document.querySelector(".tableWrap thead tr");
+    if (!headRow) return;
+    const ths = Array.from(headRow.querySelectorAll("th"));
+    const hasGroup = ths.some((th) => /group/i.test(String(th.textContent || "")));
+    if (hasGroup) return;
+    const th = document.createElement("th");
+    th.textContent = "Group";
+    th.style.width = "110px";
+    const stopTh = ths.find((x) => /stop/i.test(String(x.textContent || "")));
+    if (stopTh) headRow.insertBefore(th, stopTh);
+    else headRow.appendChild(th);
+  }
+
   // -------------------- table build + events --------------------
   function buildTable() {
     clampSelected();
     if (!ui.tbody) return;
+    const tableReadOnly = VIEWER_MODE;
+    ensureGroupTableHeaderColumn();
 
-    rememberTableFocus();
+    if (!tableReadOnly) rememberTableFocus();
     ui.tbody.innerHTML = "";
 
     lens.surfaces.forEach((s, idx) => {
@@ -880,16 +987,17 @@ function warnMissingGlass(name) {
         buildTable();
       });
 
-     const isOBJ = String(s.type || "").toUpperCase() === "OBJ";
+      const isOBJ = String(s.type || "").toUpperCase() === "OBJ";
+      const isIMS = String(s.type || "").toUpperCase() === "IMS";
 
-tr.innerHTML = `
+      tr.innerHTML = `
   <td style="width:34px; font-family:var(--mono)">${idx}</td>
   <td style="width:72px"><input class="cellInput" data-k="type" data-i="${idx}" value="${s.type}"></td>
   <td style="width:92px"><input class="cellInput" data-k="R" data-i="${idx}" type="number" step="0.01" value="${s.R}"></td>
 
   <td style="width:92px">
     <input class="cellInput" data-k="t" data-i="${idx}" type="number" step="0.01"
-      value="${isOBJ ? 0 : s.t}" ${isOBJ ? "disabled" : ""}>
+      value="${isOBJ ? 0 : s.t}" ${isOBJ || isIMS ? "disabled" : ""}>
   </td>
 
   <td style="width:92px"><input class="cellInput" data-k="ap" data-i="${idx}" type="number" step="0.01" value="${s.ap}"></td>
@@ -900,29 +1008,40 @@ tr.innerHTML = `
             ).join("")}
           </select>
         </td>
+        <td style="width:96px">
+          <input class="cellInput" data-k="groupId" data-i="${idx}" value="${s.groupId || ""}" ${isOBJ || isIMS ? "disabled" : ""}>
+        </td>
         <td class="cellChk" style="width:58px">
           <input type="checkbox" data-k="stop" data-i="${idx}" ${s.stop ? "checked" : ""}>
         </td>
       `;
+      if (tableReadOnly) {
+        tr.querySelectorAll("input, select").forEach((ctl) => {
+          ctl.disabled = true;
+          ctl.readOnly = true;
+        });
+      }
       ui.tbody.appendChild(tr);
     });
 
-    ui.tbody.querySelectorAll("input.cellInput").forEach((el) => {
-      el.addEventListener("input", onCellInput);
-      el.addEventListener("change", onCellCommit);
-      el.addEventListener("blur", onCellCommit);
-      el.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") { e.preventDefault(); onCellCommit(e); }
+    if (!tableReadOnly) {
+      ui.tbody.querySelectorAll("input.cellInput").forEach((el) => {
+        el.addEventListener("input", onCellInput);
+        el.addEventListener("change", onCellCommit);
+        el.addEventListener("blur", onCellCommit);
+        el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") { e.preventDefault(); onCellCommit(e); }
+        });
       });
-    });
 
-    ui.tbody.querySelectorAll("select.cellSelect").forEach((el) => el.addEventListener("change", onCellCommit));
-    ui.tbody.querySelectorAll('input[type="checkbox"][data-k="stop"]').forEach((el) => el.addEventListener("change", onCellCommit));
-
-    restoreTableFocus();
+      ui.tbody.querySelectorAll("select.cellSelect").forEach((el) => el.addEventListener("change", onCellCommit));
+      ui.tbody.querySelectorAll('input[type="checkbox"][data-k="stop"]').forEach((el) => el.addEventListener("change", onCellCommit));
+      restoreTableFocus();
+    }
   }
 
   function onCellInput(e) {
+    if (VIEWER_MODE) return;
     const el = e.target;
     const i = Number(el.dataset.i);
     const k = el.dataset.k;
@@ -943,6 +1062,9 @@ tr.innerHTML = `
 
     if (k === "type") s.type = String(el.value || "");
     else if (k === "R" || k === "t" || k === "ap") s[k] = num(el.value, s[k] ?? 0);
+    else if (k === "groupId") {
+      s.groupId = normalizeGroupId(el.value, s.groupId || "fixed_front");
+    }
 
     applySensorToIMS();
     scheduleRenderAll();
@@ -950,6 +1072,7 @@ tr.innerHTML = `
   }
 
   function onCellCommit(e) {
+    if (VIEWER_MODE) return;
     const el = e.target;
     const i = Number(el.dataset.i);
     const k = el.dataset.k;
@@ -972,6 +1095,8 @@ tr.innerHTML = `
       s.glass = resolveGlassName(String(el.value || "AIR"));
     } else if (k === "type") {
       s.type = String(el.value || "");
+    } else if (k === "groupId") {
+      s.groupId = normalizeGroupId(el.value, s.groupId || "fixed_front");
     } else if (k === "R" || k === "t" || k === "ap") {
       s[k] = num(el.value, s[k] ?? 0);
     }
@@ -1009,19 +1134,19 @@ tr.innerHTML = `
   }
 
   function intersectSurface(ray, surf) {
+    const INTERSECT_SHEET_TOL = 5e-4;
+    const INTERSECT_SHEET_INSIDE_TOL = 1e-7;
+    const ALLOW_LEGACY_FALLBACK_IF_NO_SHEET_HIT = true;
     const vx = surf.vx;
-    const R = surf.R;
-    const ap = Math.max(0, surf.ap);
+    const R = Number(surf.R || 0);
+    const ap = Math.max(0, Number(surf.ap || 0));
 
     if (Math.abs(R) < 1e-9) {
       if (Math.abs(ray.d.x) < 1e-12) return null;
-
       const t = (vx - ray.p.x) / ray.d.x;
       if (!Number.isFinite(t) || t <= 1e-9) return null;
-
       const hit = add(ray.p, mul(ray.d, t));
       const vignetted = Math.abs(hit.y) > ap + 1e-9;
-
       const N = { x: -1, y: 0 };
       return { hit, t, vignetted, normal: N };
     }
@@ -1042,19 +1167,46 @@ tr.innerHTML = `
     if (disc < 0) return null;
 
     const sdisc = Math.sqrt(disc);
-    const t1 = (-B - sdisc) / (2 * A);
-    const t2 = (-B + sdisc) / (2 * A);
+    const candidates = [
+      (-B - sdisc) / (2 * A),
+      (-B + sdisc) / (2 * A),
+    ];
+    let best = null;
+    let bestErr = Number.POSITIVE_INFINITY;
+    for (const t of candidates) {
+      if (!Number.isFinite(t) || t <= 1e-9) continue;
+      const hit = add(ray.p, mul(ray.d, t));
+      const sign = Math.sign(R) || 1;
+      const inside = rad * rad - hit.y * hit.y;
+      if (inside < -INTERSECT_SHEET_INSIDE_TOL) continue;
+      const expectedX = cx - sign * Math.sqrt(Math.max(0, inside));
+      const err = Math.abs(hit.x - expectedX);
+      if (err < bestErr - 1e-12 || (Math.abs(err - bestErr) <= 1e-12 && (!best || t < best.t))) {
+        bestErr = err;
+        best = { t, hit, err };
+      }
+    }
+    if (!best || bestErr > INTERSECT_SHEET_TOL) {
+      if (ALLOW_LEGACY_FALLBACK_IF_NO_SHEET_HIT) {
+        let tLegacy = null;
+        for (const t of candidates) {
+          if (!Number.isFinite(t) || t <= 1e-9) continue;
+          if (tLegacy == null || t < tLegacy) tLegacy = t;
+        }
+        if (tLegacy != null) {
+          const hitLegacy = add(ray.p, mul(ray.d, tLegacy));
+          const vignettedLegacy = Math.abs(hitLegacy.y) > ap + 1e-9;
+          const Nlegacy = normalize({ x: hitLegacy.x - cx, y: hitLegacy.y });
+          return { hit: hitLegacy, t: tLegacy, vignetted: vignettedLegacy, normal: Nlegacy };
+        }
+      }
+      return null;
+    }
 
-    let t = null;
-    if (t1 > 1e-9 && t2 > 1e-9) t = Math.min(t1, t2);
-    else if (t1 > 1e-9) t = t1;
-    else if (t2 > 1e-9) t = t2;
-    else return null;
-
-    const hit = add(ray.p, mul(ray.d, t));
+    const hit = best.hit;
     const vignetted = Math.abs(hit.y) > ap + 1e-9;
     const Nout = normalize({ x: hit.x - cx, y: hit.y });
-    return { hit, t, vignetted, normal: Nout };
+    return { hit, t: best.t, vignetted, normal: Nout };
   }
 
   function resolveZoomOffsetsForSurfaces() {
@@ -4087,26 +4239,25 @@ function wireUI() {
   on("#btnLoadOmit", "click", () => loadLens(omit50ConceptV1()));
   on("#btnLoadDemo", "click", () => loadLens(demoLensSimple()));
 
-  on("#btnAdd", "click", addSurface);
-  on("#btnAddElement", "click", () => {
-  if (typeof openElementModal === "function") {
-    const ok = openElementModal();
-    if (ok === false) toast("Element modal missing");
-  } else {
-    toast("Element modal missing");
+  if (!VIEWER_MODE) {
+    on("#btnAdd", "click", addSurface);
+    on("#btnAddElement", "click", () => {
+      if (typeof openElementModal === "function") {
+        const ok = openElementModal();
+        if (ok === false) toast("Element modal missing");
+      } else {
+        toast("Element modal missing");
+      }
+    });
+    on("#btnDuplicate", "click", duplicateSelected);
+    on("#btnMoveUp", "click", () => moveSelected(-1));
+    on("#btnMoveDown", "click", () => moveSelected(+1));
+    on("#btnRemove", "click", removeSelected);
+    on("#btnScaleToFocal", "click", scaleToTargetFocal);
+    on("#btnSetTStop", "click", setTargetTStop);
+    on("#btnSave", "click", saveLensToFile);
   }
-});
-
-  on("#btnDuplicate", "click", duplicateSelected);
-  on("#btnMoveUp", "click", () => moveSelected(-1));
-  on("#btnMoveDown", "click", () => moveSelected(+1));
-  on("#btnRemove", "click", removeSelected);
-
-  on("#btnScaleToFocal", "click", scaleToTargetFocal);
-  on("#btnSetTStop", "click", setTargetTStop);
   on("#btnAutoFocus", "click", autoFocus);
-
-  on("#btnSave", "click", saveLensToFile);
 
   // lens JSON file picker
   if (ui.fileLoad) {
@@ -4151,6 +4302,7 @@ function wireUI() {
 
   // selection hotkeys
   window.addEventListener("keydown", (e) => {
+    if (VIEWER_MODE) return;
     if (e.key === "Delete" || e.key === "Backspace") {
       if (document.activeElement && ["INPUT","TEXTAREA","SELECT"].includes(document.activeElement.tagName)) return;
       removeSelected();
@@ -4170,6 +4322,7 @@ function wireUI() {
 
 // -------------------- boot --------------------
 function boot() {
+  applyViewerModeUi();
   wireUI();
   bindViewControls();
   bindPreviewViewControls();

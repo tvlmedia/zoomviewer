@@ -52,6 +52,10 @@ body{
 }
 .skipLink:focus{ left:10px; }
 
+.viewerHidden{
+  display:none !important;
+}
+
 /* ===========================
    TOPBAR
    =========================== */
