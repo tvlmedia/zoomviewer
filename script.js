@@ -71,6 +71,7 @@
     lastRenderWasStale: false,
     lastRenderAttemptState: null,
     lastRenderAttemptAt: 0,
+    lastRenderKey: "",
 
     lastValidCanvas: document.createElement("canvas"),
     lastValidCtx: null,
@@ -180,6 +181,7 @@
     preview.lastRenderWasStale = false;
     preview.lastRenderAttemptState = null;
     preview.lastRenderAttemptAt = 0;
+    preview.lastRenderKey = "";
     preview.lastValidReady = false;
     preview.lastValidDiagMode = "";
     preview.lastValidState = null;
@@ -230,6 +232,10 @@
       }
     }
     return diff;
+  }
+
+  function isFallbackDiagMode(mode) {
+    return /fallback/i.test(String(mode || ""));
   }
 
   function markPreviewFailure(reason, diag = null) {
@@ -4903,9 +4909,8 @@ function renderPreview() {
   const jobId = ++preview.renderJobSeq;
   preview.activeRenderJob = jobId;
   const isJobActive = () => preview.activeRenderJob === jobId;
-  setNoUsableCircle("pending");
+  if (!preview.usableCircle?.valid) setNoUsableCircle("pending");
   preview.renderPending = true;
-  preview.worldReady = false;
   preview.lastRenderWasStale = false;
   preview.lastRenderAttemptAt = Date.now();
   preview.lastRenderAttemptState = buildPreviewStateSummary({
@@ -5056,6 +5061,31 @@ function renderPreview() {
   const imgW = preview.imgCanvas.width;
   const imgH = preview.imgCanvas.height;
   const imgData = hasImg ? preview.imgData : null;
+  const renderKey = [
+    `z=${Number(ui.zoomPos?.value || 0).toFixed(4)}`,
+    `fm=${focusModeUi}`,
+    `sx=${sensorX.toFixed(4)}`,
+    `lf=${lensShift.toFixed(4)}`,
+    `tag=${String(selectedState.tag || "current")}`,
+    `stop=${stopIdx}|${xStop.toFixed(4)}|${stopAp.toFixed(4)}`,
+    `obj=${xObjPlane.toFixed(2)}|${objDist.toFixed(2)}|${objH.toFixed(2)}`,
+    `sensor=${sensorW.toFixed(3)}x${sensorH.toFixed(3)}`,
+    `res=${W}x${H}|${q}|dof:${doDOF ? 1 : 0}|ca:${doCA ? 1 : 0}`,
+    `wave=${wavePreset}`,
+    `img=${hasImg ? `${imgW}x${imgH}` : "none"}`,
+    `offs=${zoomOffsetsSignature(lens?.zoomConfig?.appliedGroupOffsets || {})}`,
+  ].join(";");
+  if (
+    preview.lastRenderKey === renderKey &&
+    preview.worldReady &&
+    !preview.lastRenderFailed
+  ) {
+    preview.renderPending = false;
+    if (DEBUG_VIEWER) dbg("renderPreview:skip-duplicate", { key: renderKey, jobId });
+    drawPreviewViewport();
+    return;
+  }
+  preview.lastRenderKey = renderKey;
 
   function sample(u, v) {
     if (!hasImg) return [255, 255, 255, 255];
@@ -5775,25 +5805,20 @@ function renderPreview() {
       if (litRatio < MIN_RENDER_LIT_RATIO) {
         diagPayload.failReason = "reverse-map weak";
         console.warn("[viewer] preview output too weak", diagPayload);
+        const hasLastValid = !!preview.lastValidReady;
         const keepStrongStale =
-          !!preview.lastValidReady &&
+          hasLastValid &&
           !!preview.lastValidDiagMode &&
-          !/fallback/i.test(String(preview.lastValidDiagMode || ""));
-        if (!keepStrongStale) {
+          !isFallbackDiagMode(preview.lastValidDiagMode);
+        if (!hasLastValid) {
           const fw = renderForwardChiefFallback("lut");
           if (fw?.ok) {
             const fwDiag = fw.diag || {};
             markPreviewSuccess(fwDiag);
-            snapshotPreviewAsLastValid({
-              selectedStateTag: String(selectedState.tag || "current"),
-              choiceUsedFallback: !!choice?.usedFallback,
-              strictGeometry: !!choice?.strictGeometry,
-              stopIdx,
-              xStop,
-              stopAp,
-              xObjPlane,
-            });
-            setFooterWarn("");
+            // Never promote fallback frame to "last valid"; it is low-confidence.
+            showWarn(
+              `Preview fallback frame gebruikt (reverse weak: chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}).`
+            );
             console.info(
               `[viewer] preview forward fallback used (reverse weak: chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal})`
             );
@@ -5815,7 +5840,7 @@ function renderPreview() {
           markPreviewFailure("reverse-map weak", diagPayload);
           preview.lastRenderWasStale = true;
           showWarn(
-            `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%). Sterke vorige render behouden.`
+            `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%). ${keepStrongStale ? "Sterke vorige render behouden." : "Vorige render behouden (stale)." }`
           );
         }
       } else {
@@ -5996,25 +6021,18 @@ function renderPreview() {
         if (litRatio < MIN_RENDER_LIT_RATIO) {
           diagPayload.failReason = "reverse-map weak (dof)";
           console.warn("[viewer] preview DOF output too weak", diagPayload);
+          const hasLastValid = !!preview.lastValidReady;
           const keepStrongStale =
-            !!preview.lastValidReady &&
+            hasLastValid &&
             !!preview.lastValidDiagMode &&
-            !/fallback/i.test(String(preview.lastValidDiagMode || ""));
-          if (!keepStrongStale) {
+            !isFallbackDiagMode(preview.lastValidDiagMode);
+          if (!hasLastValid) {
             const fw = renderForwardChiefFallback("dof");
             if (fw?.ok) {
               const fwDiag = fw.diag || {};
               markPreviewSuccess(fwDiag);
-              snapshotPreviewAsLastValid({
-                selectedStateTag: String(selectedState.tag || "current"),
-                choiceUsedFallback: !!choice?.usedFallback,
-                strictGeometry: !!choice?.strictGeometry,
-                stopIdx,
-                xStop,
-                stopAp,
-                xObjPlane,
-              });
-              setFooterWarn("");
+              // Never promote fallback frame to "last valid"; it is low-confidence.
+              showWarn("Preview fallback frame gebruikt (DOF, reverse weak).");
               console.info("[viewer] preview forward fallback used (DOF reverse weak)");
               diagPayload.failReason = "";
             } else {
@@ -6029,7 +6047,7 @@ function renderPreview() {
           } else {
             markPreviewFailure("reverse-map weak (dof)", diagPayload);
             preview.lastRenderWasStale = true;
-            showWarn(`Preview render failed (DOF): reverse map weak. Sterke vorige render behouden.`);
+            showWarn(`Preview render failed (DOF): reverse map weak. ${keepStrongStale ? "Sterke vorige render behouden." : "Vorige render behouden (stale)."}`);
           }
         } else {
           markPreviewSuccess(diagPayload);
