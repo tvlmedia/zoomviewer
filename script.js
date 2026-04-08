@@ -5104,6 +5104,202 @@ function renderPreview() {
     return out;
   }
 
+  function renderForwardChiefFallback(modeHint = "lut") {
+    if (!hasImg) return { ok: false, reason: "no-source-image" };
+    const FALL_N = 720;
+    const WAVES = doCA ? ["c", "d", "g"] : [wavePreset, wavePreset, wavePreset];
+    const pairsByCh = [[], [], []];
+    const chiefCurve = new Float32Array(FALL_N);
+    const transCurve = new Float32Array(FALL_N);
+    const heatCurve = new Float32Array(FALL_N);
+
+    const rObjMax = Math.max(halfObjW, halfObjH) * 1.25;
+    if (!(rObjMax > 1e-6)) return { ok: false, reason: "object-range-invalid" };
+
+    for (let k = 0; k < FALL_N; k++) {
+      const a = FALL_N > 1 ? (k / (FALL_N - 1)) : 0;
+      const rObj = a * rObjMax;
+      const pObj = { x: xObjPlane, y: rObj };
+      const dirObj = normalize({ x: xStop - xObjPlane, y: -rObj });
+      let okCh = 0;
+
+      for (let ch = 0; ch < 3; ch++) {
+        const tr = traceRayForward(
+          { p: { x: pObj.x, y: pObj.y }, d: { x: dirObj.x, y: dirObj.y } },
+          previewSurfaces,
+          WAVES[ch],
+          { visualFallback: false }
+        );
+        if (!tr || tr.vignetted || tr.tir || !tr.endRay) continue;
+        const yS = rayHitYAtX(tr.endRay, sensorX);
+        if (!Number.isFinite(yS)) continue;
+        const rS = Math.abs(yS);
+        if (!Number.isFinite(rS) || rS > (rMaxSensor * 1.05)) continue;
+        pairsByCh[ch].push([rS, rObj]);
+        okCh++;
+      }
+
+      const chiefK = okCh / 3;
+      chiefCurve[k] = chiefK;
+      transCurve[k] = chiefK;
+      heatCurve[k] = chiefK;
+    }
+
+    const prepPairs = (pairs) => {
+      const src = Array.isArray(pairs) ? pairs.slice() : [];
+      src.sort((a, b) => Number(a[0] || 0) - Number(b[0] || 0));
+      const out = [];
+      for (const it of src) {
+        const rS = Number(it[0] || 0);
+        const rO = Number(it[1] || 0);
+        if (!Number.isFinite(rS) || !Number.isFinite(rO) || rS < 0 || rO < 0) continue;
+        if (!out.length) {
+          out.push([rS, rO]);
+          continue;
+        }
+        const prev = out[out.length - 1];
+        if (Math.abs(prev[0] - rS) <= 1e-4) {
+          prev[1] = Math.max(prev[1], rO);
+          continue;
+        }
+        if (rO < prev[1]) continue;
+        out.push([rS, rO]);
+      }
+      if (!out.length || out[0][0] > 1e-6) out.unshift([0, 0]);
+      return out;
+    };
+
+    const lutPairs = [prepPairs(pairsByCh[0]), prepPairs(pairsByCh[1]), prepPairs(pairsByCh[2])];
+    const maxR = Math.max(
+      Number(lutPairs[0]?.[lutPairs[0].length - 1]?.[0] || 0),
+      Number(lutPairs[1]?.[lutPairs[1].length - 1]?.[0] || 0),
+      Number(lutPairs[2]?.[lutPairs[2].length - 1]?.[0] || 0)
+    );
+    if (!(maxR > 1e-6)) {
+      return {
+        ok: false,
+        reason: "forward-chief-no-mapping",
+        diag: {
+          mode: "forward-chief-fallback",
+          chiefOk: 0,
+          chiefTotal: FALL_N * 3,
+          pupilOk: 0,
+          pupilTotal: 0,
+          litRatio: 0,
+          failReason: "forward-chief-no-mapping",
+          pairsCount: lutPairs.map((p) => p.length),
+        },
+      };
+    }
+
+    const interpRobj = (pairs, rS) => {
+      if (!Array.isArray(pairs) || pairs.length < 2) return NaN;
+      const rr = clamp(Number(rS || 0), 0, Number(pairs[pairs.length - 1][0] || 0));
+      let lo = 0;
+      let hi = pairs.length - 1;
+      while (lo + 1 < hi) {
+        const mid = (lo + hi) >> 1;
+        if (Number(pairs[mid][0] || 0) <= rr) lo = mid;
+        else hi = mid;
+      }
+      const r0 = Number(pairs[lo][0] || 0);
+      const r1 = Number(pairs[hi][0] || 0);
+      const o0 = Number(pairs[lo][1] || 0);
+      const o1 = Number(pairs[hi][1] || 0);
+      if (!Number.isFinite(r0) || !Number.isFinite(r1) || !Number.isFinite(o0) || !Number.isFinite(o1)) return NaN;
+      if (Math.abs(r1 - r0) < 1e-9) return o0;
+      const u = clamp((rr - r0) / (r1 - r0), 0, 1);
+      return o0 + ((o1 - o0) * u);
+    };
+
+    preview.worldCanvas.width = W;
+    preview.worldCanvas.height = H;
+    preview.worldCtx = preview.worldCanvas.getContext("2d", { willReadFrequently: true });
+    const wctx = preview.worldCtx;
+    const out = wctx.createImageData(W, H);
+    const outD = out.data;
+    let litPx = 0;
+
+    for (let py = 0; py < H; py++) {
+      const sy = (0.5 - (py + 0.5) / H) * sensorHv;
+      for (let px = 0; px < W; px++) {
+        const sx = ((px + 0.5) / W - 0.5) * sensorWv;
+        const rS = Math.hypot(sx, sy);
+        const idx = (py * W + px) * 4;
+        const nat = naturalCos4(rS);
+
+        if (rS > maxR + 1e-6) {
+          outD[idx] = 0; outD[idx + 1] = 0; outD[idx + 2] = 0; outD[idx + 3] = 255;
+          continue;
+        }
+
+        let any = false;
+        const rgb = [0, 0, 0];
+        for (let ch = 0; ch < 3; ch++) {
+          const rObj = interpRobj(lutPairs[ch], rS);
+          if (!Number.isFinite(rObj)) continue;
+          const scale = rS > 1e-9 ? (rObj / rS) : 0;
+          const ox = sx * scale;
+          const oy = sy * scale;
+          const uv = objectMmToUV(ox, oy);
+          const c = sample(uv.u, uv.v);
+          const gain = clamp(nat, 0, 1);
+          rgb[ch] = clamp(Number(c[ch] || 0) * gain, 0, 255);
+          any = true;
+        }
+
+        if (!any) {
+          outD[idx] = 0; outD[idx + 1] = 0; outD[idx + 2] = 0; outD[idx + 3] = 255;
+          continue;
+        }
+
+        litPx++;
+        outD[idx] = rgb[0];
+        outD[idx + 1] = rgb[1];
+        outD[idx + 2] = rgb[2];
+        outD[idx + 3] = 255;
+      }
+    }
+
+    wctx.putImageData(out, 0, 0);
+    const litRatio = (W * H) > 0 ? (litPx / (W * H)) : 0;
+    const chiefTotal = FALL_N * 3;
+    const chiefOk = pairsByCh[0].length + pairsByCh[1].length + pairsByCh[2].length;
+    return {
+      ok: litRatio >= MIN_RENDER_LIT_RATIO,
+      litRatio,
+      litPx,
+      diag: {
+        mode: "forward-chief-fallback",
+        fallbackFrom: modeHint,
+        failReason: litRatio >= MIN_RENDER_LIT_RATIO ? "" : "forward-chief-weak",
+        zoomPos: Number(ui.zoomPos?.value || 0),
+        focusMode: focusModeUi,
+        lensShift,
+        sensorX,
+        stopIdx,
+        stopAp,
+        xStop,
+        xObjPlane,
+        startX: sensorX + 0.05,
+        objDist,
+        chiefOk,
+        chiefTotal,
+        pupilOk: 0,
+        pupilTotal: 0,
+        litRatio,
+        litPx,
+        width: W,
+        height: H,
+        pairsCount: lutPairs.map((p) => p.length),
+        appliedGroupOffsets: clone(lens?.zoomConfig?.appliedGroupOffsets || {}),
+        chiefCurve: downsamplePreviewCurve(chiefCurve),
+        transCurve: downsamplePreviewCurve(transCurve),
+        heatCurve: downsamplePreviewCurve(heatCurve),
+      },
+    };
+  }
+
   function renderFastLUT() {
     const LUT_N = 900;
     const WAVES = doCA ? ["c", "d", "g"] : [wavePreset, wavePreset, wavePreset];
@@ -5540,16 +5736,35 @@ function renderPreview() {
       if (litRatio < MIN_RENDER_LIT_RATIO) {
         diagPayload.failReason = "reverse-map weak";
         console.warn("[viewer] preview output too weak", diagPayload);
-        markPreviewFailure("reverse-map weak", diagPayload);
-        if (preview.lastValidReady) {
-          preview.lastRenderWasStale = true;
+        const fw = renderForwardChiefFallback("lut");
+        if (fw?.ok) {
+          const fwDiag = fw.diag || {};
+          markPreviewSuccess(fwDiag);
+          snapshotPreviewAsLastValid({
+            selectedStateTag: String(selectedState.tag || "current"),
+            choiceUsedFallback: !!choice?.usedFallback,
+            strictGeometry: !!choice?.strictGeometry,
+            stopIdx,
+            xStop,
+            stopAp,
+            xObjPlane,
+          });
           showWarn(
-            `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%). Stale preview shown.`
+            `Preview gebruikt forward-chief fallback (reverse zwak: chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}).`
           );
+          diagPayload.failReason = "";
         } else {
-          showWarn(
-            `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%).`
-          );
+          markPreviewFailure("reverse-map weak", diagPayload);
+          if (preview.lastValidReady) {
+            preview.lastRenderWasStale = true;
+            showWarn(
+              `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%). Stale preview shown.`
+            );
+          } else {
+            showWarn(
+              `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%).`
+            );
+          }
         }
       } else {
         markPreviewSuccess(diagPayload);
@@ -5566,6 +5781,7 @@ function renderPreview() {
       if (DEBUG_VIEWER) {
         const currentState = preview.lastRenderAttemptState || buildPreviewStateSummary({ selectedStateTag: String(selectedState.tag || "current") });
         const lastValidDiff = diffPreviewStates(preview.lastValidState, currentState);
+        const finalDiag = preview.lastRenderDiag || null;
         console.groupCollapsed("[viewer] renderPreview result");
         console.log({
           mode: "lut",
@@ -5588,6 +5804,9 @@ function renderPreview() {
           failReason: String(diagPayload.failReason || ""),
           chiefLaunchSamples: diagPayload.chiefLaunchSamples || [],
           pupilLaunchSamples: diagPayload.pupilLaunchSamples || [],
+          finalDiagMode: String(finalDiag?.mode || ""),
+          finalDiagFailReason: String(finalDiag?.failReason || ""),
+          finalDiagLitRatio: Number(finalDiag?.litRatio || 0),
           lastValidState: preview.lastValidState || null,
           currentState,
           currentVsLastValid: lastValidDiff,
@@ -5722,12 +5941,29 @@ function renderPreview() {
         if (litRatio < MIN_RENDER_LIT_RATIO) {
           diagPayload.failReason = "reverse-map weak (dof)";
           console.warn("[viewer] preview DOF output too weak", diagPayload);
-          markPreviewFailure("reverse-map weak (dof)", diagPayload);
-          if (preview.lastValidReady) {
-            preview.lastRenderWasStale = true;
-            showWarn(`Preview render failed (DOF): reverse map weak. Stale preview shown.`);
+          const fw = renderForwardChiefFallback("dof");
+          if (fw?.ok) {
+            const fwDiag = fw.diag || {};
+            markPreviewSuccess(fwDiag);
+            snapshotPreviewAsLastValid({
+              selectedStateTag: String(selectedState.tag || "current"),
+              choiceUsedFallback: !!choice?.usedFallback,
+              strictGeometry: !!choice?.strictGeometry,
+              stopIdx,
+              xStop,
+              stopAp,
+              xObjPlane,
+            });
+            showWarn(`Preview gebruikt forward-chief fallback (DOF reverse zwak).`);
+            diagPayload.failReason = "";
           } else {
-            showWarn(`Preview render failed (DOF): reverse map weak.`);
+            markPreviewFailure("reverse-map weak (dof)", diagPayload);
+            if (preview.lastValidReady) {
+              preview.lastRenderWasStale = true;
+              showWarn(`Preview render failed (DOF): reverse map weak. Stale preview shown.`);
+            } else {
+              showWarn(`Preview render failed (DOF): reverse map weak.`);
+            }
           }
         } else {
           markPreviewSuccess(diagPayload);
@@ -5744,6 +5980,7 @@ function renderPreview() {
         if (DEBUG_VIEWER) {
           const currentState = preview.lastRenderAttemptState || buildPreviewStateSummary({ selectedStateTag: String(selectedState.tag || "current") });
           const lastValidDiff = diffPreviewStates(preview.lastValidState, currentState);
+          const finalDiag = preview.lastRenderDiag || null;
           console.groupCollapsed("[viewer] renderPreview result");
           console.log({
             mode: "dof",
@@ -5764,6 +6001,9 @@ function renderPreview() {
             pupilTotal: Number(diagPayload.pupilTotal || 0),
             litRatio: Number(diagPayload.litRatio || 0),
             failReason: String(diagPayload.failReason || ""),
+            finalDiagMode: String(finalDiag?.mode || ""),
+            finalDiagFailReason: String(finalDiag?.failReason || ""),
+            finalDiagLitRatio: Number(finalDiag?.litRatio || 0),
             lastValidState: preview.lastValidState || null,
             currentState,
             currentVsLastValid: lastValidDiff,
