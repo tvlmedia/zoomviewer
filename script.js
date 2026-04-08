@@ -4896,12 +4896,15 @@ function renderPreview() {
   if (!preview.worldCtx) preview.worldCtx = preview.worldCanvas.getContext("2d");
   setNoUsableCircle("pending");
   preview.renderPending = true;
+  preview.worldReady = false;
+  preview.lastRenderWasStale = false;
   preview.lastRenderAttemptAt = Date.now();
   preview.lastRenderAttemptState = buildPreviewStateSummary({
     selectedStateTag: "pending",
     choiceUsedFallback: false,
     strictGeometry: false,
   });
+  drawPreviewViewport();
 
   const doDOF = !!document.getElementById("optDOF")?.checked;
   const doCA  = !!document.getElementById("optCA")?.checked;
@@ -5106,70 +5109,90 @@ function renderPreview() {
 
   function renderForwardChiefFallback(modeHint = "lut") {
     if (!hasImg) return { ok: false, reason: "no-source-image" };
-    const FALL_N = 720;
+    const MAP_N = 360;
+    const PUPIL_SAMPLES = doCA ? 7 : 9;
     const WAVES = doCA ? ["c", "d", "g"] : [wavePreset, wavePreset, wavePreset];
-    const pairsByCh = [[], [], []];
-    const chiefCurve = new Float32Array(FALL_N);
-    const transCurve = new Float32Array(FALL_N);
-    const heatCurve = new Float32Array(FALL_N);
+    const mapByCh = [[], [], []];
+    const chiefCurve = new Float32Array(MAP_N);
+    const transCurve = new Float32Array(MAP_N);
+    const heatCurve = new Float32Array(MAP_N);
 
-    const rObjMax = Math.max(halfObjW, halfObjH) * 1.25;
+    const rObjMax = Math.max(halfObjW, halfObjH) * 1.35;
     if (!(rObjMax > 1e-6)) return { ok: false, reason: "object-range-invalid" };
 
-    for (let k = 0; k < FALL_N; k++) {
-      const a = FALL_N > 1 ? (k / (FALL_N - 1)) : 0;
+    for (let k = 0; k < MAP_N; k++) {
+      const a = MAP_N > 1 ? (k / (MAP_N - 1)) : 0;
       const rObj = a * rObjMax;
       const pObj = { x: xObjPlane, y: rObj };
-      const dirObj = normalize({ x: xStop - xObjPlane, y: -rObj });
-      let okCh = 0;
 
+      let chOk = 0;
+      let chTransAcc = 0;
       for (let ch = 0; ch < 3; ch++) {
-        const tr = traceRayForward(
-          { p: { x: pObj.x, y: pObj.y }, d: { x: dirObj.x, y: dirObj.y } },
-          previewSurfaces,
-          WAVES[ch],
-          { visualFallback: false }
-        );
-        if (!tr || tr.vignetted || tr.tir || !tr.endRay) continue;
-        const yS = rayHitYAtX(tr.endRay, sensorX);
-        if (!Number.isFinite(yS)) continue;
-        const rS = Math.abs(yS);
-        if (!Number.isFinite(rS) || rS > (rMaxSensor * 1.05)) continue;
-        pairsByCh[ch].push([rS, rObj]);
-        okCh++;
+        let total = 0;
+        let pass = 0;
+        const hits = [];
+        for (let i = 0; i < PUPIL_SAMPLES; i++) {
+          const u = (i + 0.5) / PUPIL_SAMPLES;
+          const yStop = (((u * 2) - 1) * stopAp) * 0.98;
+          const dir = normalize({ x: xStop - xObjPlane, y: yStop - rObj });
+          if (!Number.isFinite(dir.x) || !Number.isFinite(dir.y)) continue;
+          total++;
+          const tr = traceRayForward(
+            { p: { x: pObj.x, y: pObj.y }, d: { x: dir.x, y: dir.y } },
+            previewSurfaces,
+            WAVES[ch],
+            { visualFallback: false }
+          );
+          if (!tr || tr.vignetted || tr.tir || !tr.endRay) continue;
+          const yS = rayHitYAtX(tr.endRay, sensorX);
+          if (!Number.isFinite(yS)) continue;
+          const rS = Math.abs(yS);
+          if (!Number.isFinite(rS) || rS > (rMaxSensor * 1.25)) continue;
+          pass++;
+          hits.push(rS);
+        }
+        if (!total || !hits.length) continue;
+        const rS = hits.reduce((acc, v) => acc + v, 0) / hits.length;
+        const trans = pass / total;
+        mapByCh[ch].push([rS, rObj, trans]);
+        chOk++;
+        chTransAcc += trans;
       }
 
-      const chiefK = okCh / 3;
+      const chiefK = chOk / 3;
+      const transK = chOk > 0 ? (chTransAcc / chOk) : 0;
       chiefCurve[k] = chiefK;
-      transCurve[k] = chiefK;
-      heatCurve[k] = chiefK;
+      transCurve[k] = transK;
+      heatCurve[k] = Math.max(0, Math.min(1, chiefK * 0.55 + transK * 0.45));
     }
 
     const prepPairs = (pairs) => {
       const src = Array.isArray(pairs) ? pairs.slice() : [];
-      src.sort((a, b) => Number(a[0] || 0) - Number(b[0] || 0));
+      src.sort((a, b) => Number(a?.[0] || 0) - Number(b?.[0] || 0));
       const out = [];
       for (const it of src) {
-        const rS = Number(it[0] || 0);
-        const rO = Number(it[1] || 0);
+        const rS = Number(it?.[0] || 0);
+        const rO = Number(it?.[1] || 0);
+        const tr = clamp(Number(it?.[2] || 0), 0, 1);
         if (!Number.isFinite(rS) || !Number.isFinite(rO) || rS < 0 || rO < 0) continue;
         if (!out.length) {
-          out.push([rS, rO]);
+          out.push([rS, rO, tr]);
           continue;
         }
         const prev = out[out.length - 1];
         if (Math.abs(prev[0] - rS) <= 1e-4) {
           prev[1] = Math.max(prev[1], rO);
+          prev[2] = Math.max(prev[2], tr);
           continue;
         }
         if (rO < prev[1]) continue;
-        out.push([rS, rO]);
+        out.push([rS, rO, tr]);
       }
-      if (!out.length || out[0][0] > 1e-6) out.unshift([0, 0]);
+      if (!out.length || out[0][0] > 1e-6) out.unshift([0, 0, 1]);
       return out;
     };
 
-    const lutPairs = [prepPairs(pairsByCh[0]), prepPairs(pairsByCh[1]), prepPairs(pairsByCh[2])];
+    const lutPairs = [prepPairs(mapByCh[0]), prepPairs(mapByCh[1]), prepPairs(mapByCh[2])];
     const maxR = Math.max(
       Number(lutPairs[0]?.[lutPairs[0].length - 1]?.[0] || 0),
       Number(lutPairs[1]?.[lutPairs[1].length - 1]?.[0] || 0),
@@ -5178,22 +5201,22 @@ function renderPreview() {
     if (!(maxR > 1e-6)) {
       return {
         ok: false,
-        reason: "forward-chief-no-mapping",
+        reason: "forward-bundle-no-mapping",
         diag: {
-          mode: "forward-chief-fallback",
+          mode: "forward-bundle-fallback",
           chiefOk: 0,
-          chiefTotal: FALL_N * 3,
+          chiefTotal: MAP_N * 3,
           pupilOk: 0,
-          pupilTotal: 0,
+          pupilTotal: MAP_N * PUPIL_SAMPLES * 3,
           litRatio: 0,
-          failReason: "forward-chief-no-mapping",
+          failReason: "forward-bundle-no-mapping",
           pairsCount: lutPairs.map((p) => p.length),
         },
       };
     }
 
-    const interpRobj = (pairs, rS) => {
-      if (!Array.isArray(pairs) || pairs.length < 2) return NaN;
+    const interpPair = (pairs, rS) => {
+      if (!Array.isArray(pairs) || pairs.length < 2) return null;
       const rr = clamp(Number(rS || 0), 0, Number(pairs[pairs.length - 1][0] || 0));
       let lo = 0;
       let hi = pairs.length - 1;
@@ -5206,10 +5229,15 @@ function renderPreview() {
       const r1 = Number(pairs[hi][0] || 0);
       const o0 = Number(pairs[lo][1] || 0);
       const o1 = Number(pairs[hi][1] || 0);
-      if (!Number.isFinite(r0) || !Number.isFinite(r1) || !Number.isFinite(o0) || !Number.isFinite(o1)) return NaN;
-      if (Math.abs(r1 - r0) < 1e-9) return o0;
+      const t0 = clamp(Number(pairs[lo][2] || 0), 0, 1);
+      const t1 = clamp(Number(pairs[hi][2] || 0), 0, 1);
+      if (!Number.isFinite(r0) || !Number.isFinite(r1) || !Number.isFinite(o0) || !Number.isFinite(o1)) return null;
+      if (Math.abs(r1 - r0) < 1e-9) return { rObj: o0, trans: t0 };
       const u = clamp((rr - r0) / (r1 - r0), 0, 1);
-      return o0 + ((o1 - o0) * u);
+      return {
+        rObj: o0 + ((o1 - o0) * u),
+        trans: t0 + ((t1 - t0) * u),
+      };
     };
 
     preview.worldCanvas.width = W;
@@ -5236,14 +5264,14 @@ function renderPreview() {
         let any = false;
         const rgb = [0, 0, 0];
         for (let ch = 0; ch < 3; ch++) {
-          const rObj = interpRobj(lutPairs[ch], rS);
-          if (!Number.isFinite(rObj)) continue;
-          const scale = rS > 1e-9 ? (rObj / rS) : 0;
+          const p = interpPair(lutPairs[ch], rS);
+          if (!p || !Number.isFinite(p.rObj)) continue;
+          const scale = rS > 1e-9 ? (p.rObj / rS) : 0;
           const ox = sx * scale;
           const oy = sy * scale;
           const uv = objectMmToUV(ox, oy);
           const c = sample(uv.u, uv.v);
-          const gain = clamp(nat, 0, 1);
+          const gain = clamp(Number(p.trans || 0) * nat, 0, 1);
           rgb[ch] = clamp(Number(c[ch] || 0) * gain, 0, 255);
           any = true;
         }
@@ -5263,16 +5291,16 @@ function renderPreview() {
 
     wctx.putImageData(out, 0, 0);
     const litRatio = (W * H) > 0 ? (litPx / (W * H)) : 0;
-    const chiefTotal = FALL_N * 3;
-    const chiefOk = pairsByCh[0].length + pairsByCh[1].length + pairsByCh[2].length;
+    const chiefTotal = MAP_N * 3;
+    const chiefOk = mapByCh[0].length + mapByCh[1].length + mapByCh[2].length;
     return {
       ok: litRatio >= MIN_RENDER_LIT_RATIO,
       litRatio,
       litPx,
       diag: {
-        mode: "forward-chief-fallback",
+        mode: "forward-bundle-fallback",
         fallbackFrom: modeHint,
-        failReason: litRatio >= MIN_RENDER_LIT_RATIO ? "" : "forward-chief-weak",
+        failReason: litRatio >= MIN_RENDER_LIT_RATIO ? "" : "forward-bundle-weak",
         zoomPos: Number(ui.zoomPos?.value || 0),
         focusMode: focusModeUi,
         lensShift,
@@ -5286,7 +5314,7 @@ function renderPreview() {
         chiefOk,
         chiefTotal,
         pupilOk: 0,
-        pupilTotal: 0,
+        pupilTotal: MAP_N * PUPIL_SAMPLES * 3,
         litRatio,
         litPx,
         width: W,
@@ -5749,8 +5777,9 @@ function renderPreview() {
             stopAp,
             xObjPlane,
           });
-          showWarn(
-            `Preview gebruikt forward-chief fallback (reverse zwak: chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}).`
+          setFooterWarn("");
+          console.info(
+            `[viewer] preview forward fallback used (reverse weak: chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal})`
           );
           diagPayload.failReason = "";
         } else {
@@ -5954,7 +5983,8 @@ function renderPreview() {
               stopAp,
               xObjPlane,
             });
-            showWarn(`Preview gebruikt forward-chief fallback (DOF reverse zwak).`);
+            setFooterWarn("");
+            console.info("[viewer] preview forward fallback used (DOF reverse weak)");
             diagPayload.failReason = "";
           } else {
             markPreviewFailure("reverse-map weak (dof)", diagPayload);
