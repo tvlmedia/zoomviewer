@@ -62,6 +62,8 @@
     worldCtx: null,
     worldReady: false,
     renderPending: false,
+    renderJobSeq: 0,
+    activeRenderJob: 0,
     dirtyKey: "",
     lastRenderFailed: false,
     lastRenderFailReason: "",
@@ -73,6 +75,7 @@
     lastValidCanvas: document.createElement("canvas"),
     lastValidCtx: null,
     lastValidReady: false,
+    lastValidDiagMode: "",
     lastValidState: null,
     lastValidAt: 0,
 
@@ -169,6 +172,7 @@
   function resetPreviewRuntimeState(reason = "") {
     preview.worldReady = false;
     preview.renderPending = false;
+    preview.activeRenderJob = 0;
     preview.dirtyKey = "";
     preview.lastRenderFailed = false;
     preview.lastRenderFailReason = "";
@@ -177,6 +181,7 @@
     preview.lastRenderAttemptState = null;
     preview.lastRenderAttemptAt = 0;
     preview.lastValidReady = false;
+    preview.lastValidDiagMode = "";
     preview.lastValidState = null;
     preview.lastValidAt = 0;
     preview.lastValidCanvas.width = 0;
@@ -255,6 +260,7 @@
     preview.lastValidCtx.drawImage(preview.worldCanvas, 0, 0);
     preview.lastValidReady = true;
     preview.lastValidAt = Date.now();
+    preview.lastValidDiagMode = String(preview.lastRenderDiag?.mode || "");
     preview.lastValidState = buildPreviewStateSummary(stateMeta && typeof stateMeta === "object" ? stateMeta : null);
     if (DEBUG_VIEWER) {
       const currentState = buildPreviewStateSummary(preview.lastRenderAttemptState || null);
@@ -4894,6 +4900,9 @@ function traceRayForward(ray, surfaces, wavePreset, opts = {}) {
 function renderPreview() {
   if (!pctx || !previewCanvasEl) return;
   if (!preview.worldCtx) preview.worldCtx = preview.worldCanvas.getContext("2d");
+  const jobId = ++preview.renderJobSeq;
+  preview.activeRenderJob = jobId;
+  const isJobActive = () => preview.activeRenderJob === jobId;
   setNoUsableCircle("pending");
   preview.renderPending = true;
   preview.worldReady = false;
@@ -5397,6 +5406,7 @@ function renderPreview() {
     };
 
     function buildStep() {
+      if (!isJobActive()) return;
       const end = Math.min(LUT_N, k + kPerFrame);
       setPreviewProgress(k / LUT_N, `LUT ${Math.round((k / LUT_N) * 100)}%`);
 
@@ -5559,9 +5569,10 @@ function renderPreview() {
       }
 
       if (k < LUT_N) {
-        requestAnimationFrame(buildStep);
+        if (isJobActive()) requestAnimationFrame(buildStep);
         return;
       }
+      if (!isJobActive()) return;
 
       if (lutDiag.chiefOk <= 0 || lutDiag.pupilOk <= 0) {
         console.warn("[viewer] preview LUT weak for current lens state", {
@@ -5764,36 +5775,48 @@ function renderPreview() {
       if (litRatio < MIN_RENDER_LIT_RATIO) {
         diagPayload.failReason = "reverse-map weak";
         console.warn("[viewer] preview output too weak", diagPayload);
-        const fw = renderForwardChiefFallback("lut");
-        if (fw?.ok) {
-          const fwDiag = fw.diag || {};
-          markPreviewSuccess(fwDiag);
-          snapshotPreviewAsLastValid({
-            selectedStateTag: String(selectedState.tag || "current"),
-            choiceUsedFallback: !!choice?.usedFallback,
-            strictGeometry: !!choice?.strictGeometry,
-            stopIdx,
-            xStop,
-            stopAp,
-            xObjPlane,
-          });
-          setFooterWarn("");
-          console.info(
-            `[viewer] preview forward fallback used (reverse weak: chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal})`
-          );
-          diagPayload.failReason = "";
+        const keepStrongStale =
+          !!preview.lastValidReady &&
+          !!preview.lastValidDiagMode &&
+          !/fallback/i.test(String(preview.lastValidDiagMode || ""));
+        if (!keepStrongStale) {
+          const fw = renderForwardChiefFallback("lut");
+          if (fw?.ok) {
+            const fwDiag = fw.diag || {};
+            markPreviewSuccess(fwDiag);
+            snapshotPreviewAsLastValid({
+              selectedStateTag: String(selectedState.tag || "current"),
+              choiceUsedFallback: !!choice?.usedFallback,
+              strictGeometry: !!choice?.strictGeometry,
+              stopIdx,
+              xStop,
+              stopAp,
+              xObjPlane,
+            });
+            setFooterWarn("");
+            console.info(
+              `[viewer] preview forward fallback used (reverse weak: chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal})`
+            );
+            diagPayload.failReason = "";
+          } else {
+            markPreviewFailure("reverse-map weak", diagPayload);
+            if (preview.lastValidReady) {
+              preview.lastRenderWasStale = true;
+              showWarn(
+                `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%). Stale preview shown.`
+              );
+            } else {
+              showWarn(
+                `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%).`
+              );
+            }
+          }
         } else {
           markPreviewFailure("reverse-map weak", diagPayload);
-          if (preview.lastValidReady) {
-            preview.lastRenderWasStale = true;
-            showWarn(
-              `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%). Stale preview shown.`
-            );
-          } else {
-            showWarn(
-              `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%).`
-            );
-          }
+          preview.lastRenderWasStale = true;
+          showWarn(
+            `Preview render failed: reverse map weak (chief ${diagPayload.chiefOk}/${diagPayload.chiefTotal}, pupil ${diagPayload.pupilOk}/${diagPayload.pupilTotal}, zoom ${diagPayload.zoomPos}%). Sterke vorige render behouden.`
+          );
         }
       } else {
         markPreviewSuccess(diagPayload);
@@ -5842,11 +5865,12 @@ function renderPreview() {
         });
         console.groupEnd();
       }
+      if (!isJobActive()) return;
       hidePreviewProgress();
       drawPreviewViewport();
     }
 
-    requestAnimationFrame(buildStep);
+    if (isJobActive()) requestAnimationFrame(buildStep);
   }
 
   function renderDOFPath() {
@@ -5869,6 +5893,7 @@ function renderPreview() {
     const rowsPerChunk = (q === "hq") ? 10 : (q === "draft" ? 24 : 16);
 
     function step() {
+      if (!isJobActive()) return;
       const yEnd = Math.min(H, row + rowsPerChunk);
       setPreviewProgress(row / H, `DOF ${Math.round((row / H) * 100)}%`);
 
@@ -5944,6 +5969,7 @@ function renderPreview() {
       }
 
       wctx.putImageData(out, 0, 0);
+      if (!isJobActive()) return;
       if (row < H) {
         preview.worldReady = true;
       } else {
@@ -5970,30 +5996,40 @@ function renderPreview() {
         if (litRatio < MIN_RENDER_LIT_RATIO) {
           diagPayload.failReason = "reverse-map weak (dof)";
           console.warn("[viewer] preview DOF output too weak", diagPayload);
-          const fw = renderForwardChiefFallback("dof");
-          if (fw?.ok) {
-            const fwDiag = fw.diag || {};
-            markPreviewSuccess(fwDiag);
-            snapshotPreviewAsLastValid({
-              selectedStateTag: String(selectedState.tag || "current"),
-              choiceUsedFallback: !!choice?.usedFallback,
-              strictGeometry: !!choice?.strictGeometry,
-              stopIdx,
-              xStop,
-              stopAp,
-              xObjPlane,
-            });
-            setFooterWarn("");
-            console.info("[viewer] preview forward fallback used (DOF reverse weak)");
-            diagPayload.failReason = "";
+          const keepStrongStale =
+            !!preview.lastValidReady &&
+            !!preview.lastValidDiagMode &&
+            !/fallback/i.test(String(preview.lastValidDiagMode || ""));
+          if (!keepStrongStale) {
+            const fw = renderForwardChiefFallback("dof");
+            if (fw?.ok) {
+              const fwDiag = fw.diag || {};
+              markPreviewSuccess(fwDiag);
+              snapshotPreviewAsLastValid({
+                selectedStateTag: String(selectedState.tag || "current"),
+                choiceUsedFallback: !!choice?.usedFallback,
+                strictGeometry: !!choice?.strictGeometry,
+                stopIdx,
+                xStop,
+                stopAp,
+                xObjPlane,
+              });
+              setFooterWarn("");
+              console.info("[viewer] preview forward fallback used (DOF reverse weak)");
+              diagPayload.failReason = "";
+            } else {
+              markPreviewFailure("reverse-map weak (dof)", diagPayload);
+              if (preview.lastValidReady) {
+                preview.lastRenderWasStale = true;
+                showWarn(`Preview render failed (DOF): reverse map weak. Stale preview shown.`);
+              } else {
+                showWarn(`Preview render failed (DOF): reverse map weak.`);
+              }
+            }
           } else {
             markPreviewFailure("reverse-map weak (dof)", diagPayload);
-            if (preview.lastValidReady) {
-              preview.lastRenderWasStale = true;
-              showWarn(`Preview render failed (DOF): reverse map weak. Stale preview shown.`);
-            } else {
-              showWarn(`Preview render failed (DOF): reverse map weak.`);
-            }
+            preview.lastRenderWasStale = true;
+            showWarn(`Preview render failed (DOF): reverse map weak. Sterke vorige render behouden.`);
           }
         } else {
           markPreviewSuccess(diagPayload);
@@ -6041,17 +6077,21 @@ function renderPreview() {
           console.groupEnd();
         }
       }
+      if (!isJobActive()) return;
       drawPreviewViewport();
 
-      if (row < H) requestAnimationFrame(step);
+      if (row < H) {
+        if (isJobActive()) requestAnimationFrame(step);
+      }
       else {
         setUsableCircleFromRenderedPixels(outD, W, H, sensorW, sensorH);
+        if (!isJobActive()) return;
         hidePreviewProgress();
         drawPreviewViewport();
       }
     }
 
-    requestAnimationFrame(step);
+    if (isJobActive()) requestAnimationFrame(step);
   }
 
   // --- run ---
